@@ -33,54 +33,95 @@ except ImportError:
         print("❌ 错误：无法找到 helper.py。请确保该文件与本脚本在同一目录下。")
         sys.exit(1)
 
+
+class DualPoolingWrapper(nn.Module):
+    """
+    MaxSim 思想实现：
+    同时保留 '全局上下文 (Avg)' 和 '显著性特征 (Max)'。
+    输出维度翻倍。
+    """
+    def __init__(self, feature_extractor):
+        super().__init__()
+        self.features = feature_extractor
+        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.max_pool = nn.AdaptiveMaxPool2d((1, 1))
+    
+    def forward(self, x):
+        # 提取特征图 (B, C, H, W)
+        x = self.features(x)
+        # 全局平均池化 (Context)
+        x_avg = self.avg_pool(x).flatten(1)
+        # 全局最大池化 (Salience/MaxSim)
+        x_max = self.max_pool(x).flatten(1)
+        # 拼接 (B, 2*C)
+        return torch.cat([x_avg, x_max], dim=1)
+
 # ==========================================
 # 0. 特征提取工具 (Feature Extractor)
 # ==========================================
 def build_backbone(feature_type: str):
-    """根据指定名称构建预训练特征提取器，并移除分类头。"""
+    """根据指定名称构建预训练特征提取器，并启用 DualPooling。"""
 
     feature_type = feature_type.lower()
+    base_model = None
+    out_dim = 0
 
     if feature_type == 'resnet18':
-        model = torchvision.models.resnet18(pretrained=True)
-        model.fc = nn.Identity()  # 输出 512 维
-        out_dim = 512
+        model = torchvision.models.resnet18(weights='IMAGENET1K_V1')
+        # 剥离最后的 avgpool 和 fc，只保留卷积部分
+        feature_extractor = nn.Sequential(*list(model.children())[:-2])
+        model = DualPoolingWrapper(feature_extractor)
+        out_dim = 512 * 2 # Concat
+        
     elif feature_type == 'resnet50':
-        model = torchvision.models.resnet50(pretrained=True)
-        model.fc = nn.Identity()  # 输出 2048 维
-        out_dim = 2048
+        model = torchvision.models.resnet50(weights='IMAGENET1K_V1')
+        feature_extractor = nn.Sequential(*list(model.children())[:-2])
+        model = DualPoolingWrapper(feature_extractor)
+        out_dim = 2048 * 2
+
     elif feature_type == 'vgg11':
-        model = torchvision.models.vgg11_bn(pretrained=True)
-        model.classifier = nn.Identity()  # 输出 25088 维
-        out_dim = 25088
+        model = torchvision.models.vgg11_bn(weights='IMAGENET1K_V1')
+        # VGG 的 features 就是卷积部分
+        feature_extractor = model.features
+        model = DualPoolingWrapper(feature_extractor)
+        out_dim = 512 * 2 # VGG11 最后一层是 512通道
+
     elif feature_type == 'mobilenet_v2':
-        model = torchvision.models.mobilenet_v2(pretrained=True)
-        model.classifier = nn.Identity()  # 输出 1280 维
-        out_dim = 1280
+        model = torchvision.models.mobilenet_v2(weights='IMAGENET1K_V1')
+        # MobileNet 的 features 是卷积部分
+        feature_extractor = model.features
+        model = DualPoolingWrapper(feature_extractor)
+        out_dim = 1280 * 2
+
     elif feature_type == 'densenet121':
-        model = torchvision.models.densenet121(pretrained=True)
-        model.classifier = nn.Identity()  # 输出 1024 维
-        out_dim = 1024
+        model = torchvision.models.densenet121(weights='IMAGENET1K_V1')
+        feature_extractor = model.features
+        model = DualPoolingWrapper(feature_extractor)
+        out_dim = 1024 * 2 # DenseNet121 end dim
     
     # --- 新增前沿模型 ---
     elif feature_type == 'efficientnet_b0':
         # Google EfficientNet: 效率之王
-        model = torchvision.models.efficientnet_b0(pretrained=True)
-        model.classifier = nn.Identity() # 输出 1280 维
-        out_dim = 1280
+        model = torchvision.models.efficientnet_b0(weights='IMAGENET1K_V1')
+        feature_extractor = model.features
+        model = DualPoolingWrapper(feature_extractor)
+        out_dim = 1280 * 2
     
     elif feature_type == 'convnext_tiny':
-        # Meta ConvNeXt: 现代 CNN 的巅峰 (对标 Transformer)
-        model = torchvision.models.convnext_tiny(pretrained=True)
-        # ConvNeXt 的 classifier 包含 Flatten，所以我们要保留 Flatten
-        model.classifier = nn.Flatten(1) # 输出 768 维
-        out_dim = 768
+        # Meta ConvNeXt: 现代 CNN 的巅峰
+        model = torchvision.models.convnext_tiny(weights='IMAGENET1K_V1')
+        feature_extractor = model.features
+        model = DualPoolingWrapper(feature_extractor)
+        out_dim = 768 * 2
         
     elif feature_type == 'vit_b_16':
         # Vision Transformer: 纯注意力机制
-        model = torchvision.models.vit_b_16(pretrained=True)
+        # ViT 比较特殊，它的结构不适合做 Spatial Pooling (已有 CLS token)
+        # 且我们之前的测试显示它效果一般，这里暂不应用 DualPooling
+        model = torchvision.models.vit_b_16(weights='IMAGENET1K_V1')
         model.heads = nn.Identity() # 输出 768 维
         out_dim = 768
+        print("⚠️ 注意: MaxSim (DualPooling) 未应用于 ViT，仅用于 CNN 架构。")
         
     else:
         raise ValueError(f"不支持的特征类型: {feature_type}")
