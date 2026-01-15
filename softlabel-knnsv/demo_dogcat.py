@@ -105,6 +105,12 @@ def extract_features(data_loader, feature_type: str):
         for inputs, _ in tqdm(data_loader, desc=f"Extraction-{feature_type}"):
             inputs = inputs.to(device)
             outputs = model(inputs)
+            
+            # --- 关键修改：L2 归一化 ---
+            # 这会将特征向量投影到单位球面上
+            # 使得后续的欧氏距离计算等价于余弦距离 (1 - CosSim)
+            outputs = torch.nn.functional.normalize(outputs, p=2, dim=1)
+            
             features_list.append(outputs.cpu().numpy())
 
     return np.concatenate(features_list, axis=0)
