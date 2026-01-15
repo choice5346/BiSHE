@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+torch_cache/
+data/
+softlabel-knnsv/result/
+softlabel-knnsv/OpenML_datasets/
+*.pkl
+*.tar.gz
+*.pth
