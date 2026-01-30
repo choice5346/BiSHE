@@ -14,6 +14,7 @@ import torchvision
 import torchvision.transforms as transforms
 from sklearn.metrics import roc_auc_score, f1_score
 from sklearn.cluster import KMeans
+from sklearn.linear_model import LogisticRegression
 import time
 import argparse
 from tqdm import tqdm
@@ -223,16 +224,17 @@ def main():
     )
     parser.add_argument('--n_train', type=int, default=500, help="训练数据量")
     parser.add_argument('--n_val', type=int, default=100, help="验证数据量")
+    parser.add_argument('--flip_ratio', type=float, default=0.1, help="噪声比例 (0.0 - 1.0)")
     args = parser.parse_args()
 
-    print(f"🚀 开始 Soft-label KNN-Shapley 演示 (Cat vs Dog) | 模式: {args.feature_type}")
+    print(f"🚀 开始 Soft-label KNN-Shapley 演示 (Cat vs Dog) | 模式: {args.feature_type} | 噪声: {args.flip_ratio:.0%}")
     print("=" * 50)
 
     # 1. 获取数据
     data = get_dog_cat_data(
         n_train=args.n_train, 
         n_val=args.n_val, 
-        flip_ratio=0.1, 
+        flip_ratio=args.flip_ratio, 
         feature_type=args.feature_type
     )
     
@@ -295,6 +297,59 @@ def main():
         print("👍 不错！(Good)")
     else:
         print("⚠️ 效果一般 (Average)")
+        
+    # ==========================================
+    # 4. 下游任务应用：数据清洗后的模型重训练
+    # ==========================================
+    print("\n🏭 [下游任务验证]：清洗数据是否能提升模型性能？")
+    print("-" * 60)
+    
+    def train_and_eval(name, x_train, y_train, x_val, y_val):
+        """训练一个简单的线性分类器 (Linear Probing) 并评估准确率"""
+        # 使用 sklearn 的 LogisticRegression 作为分类头
+        clf = LogisticRegression(solver='liblinear', C=1.0, max_iter=2000, random_state=42)
+        clf.fit(x_train, y_train)
+        acc = clf.score(x_val, y_val)
+        print(f"   ► [{name:<15}] Val Acc: {acc:.2%} (Samples: {len(x_train)})")
+        return acc
+
+    # Case 1: 原始脏数据训练 (Baseline)
+    acc_dirty = train_and_eval("Dirty (Full)", x_train, y_train, x_val, y_val)
+    
+    # Case 2: 随机剔除 (Random Baseline) - 作为对照组
+    # 模拟我们不知道哪些是脏的，随便删掉 10%
+    n_remove = int(len(sv) * 0.1) # 假设我们知道大概有10%的脏数据
+    random_indices = np.random.choice(len(y_train), len(y_train) - n_remove, replace=False)
+    acc_random = train_and_eval("Random Drop", x_train[random_indices], y_train[random_indices], x_val, y_val)
+
+    # Case 3: 智能清洗 (Smart Cleaning by KNN-SV)
+    # 策略：剔除 Shapley Value 最低的 10% 数据
+    # 这里的阈值可以是固定的 10%，也可以用 KMeans 自动聚类得到
+    
+    # 策略 A: 剔除 Top-10% 最低分
+    sorted_indices = np.argsort(sv)
+    keep_indices_rank = sorted_indices[n_remove:] # 保留分数靠前的 90%
+    acc_clean_rank = train_and_eval("Clean (Rank)", x_train[keep_indices_rank], y_train[keep_indices_rank], x_val, y_val)
+
+    # 策略 B: 剔除 KMeans 聚类中的低分簇 (更加自动)
+    X_sv = sv.reshape(-1, 1)
+    kmeans = KMeans(n_clusters=2, random_state=42, n_init=10).fit(X_sv)
+    # 找到中心较小的那个簇
+    dirty_cluster_label = np.argmin(kmeans.cluster_centers_.flatten())
+    keep_indices_cluster = np.where(kmeans.labels_ != dirty_cluster_label)[0]
+    
+    # 如果 KMeans 把大部分数据都当成脏的了（异常情况），就不使用
+    if len(keep_indices_cluster) < 10:
+        keep_indices_cluster = keep_indices_rank # 回退到 Rank 策略
+        
+    acc_clean_cluster = train_and_eval("Clean (Auto)", x_train[keep_indices_cluster], y_train[keep_indices_cluster], x_val, y_val)
+
+    print("-" * 60)
+    improvement = max(acc_clean_rank, acc_clean_cluster) - acc_dirty
+    if improvement > 0.005:
+        print(f"✅ 成功验证！通过删除有害数据，模型精度提升了 +{improvement:.2%}")
+    else:
+        print(f"⚖️ 提升不明显。可能是模型鲁棒性太强，或者噪声影响有限。")
 
 if __name__ == "__main__":
     main()
