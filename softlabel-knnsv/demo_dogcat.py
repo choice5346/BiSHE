@@ -222,8 +222,8 @@ def main():
                  'efficientnet_b0', 'convnext_tiny', 'vit_b_16'],
         help="选择使用的特征类型"
     )
-    parser.add_argument('--n_train', type=int, default=500, help="训练数据量")
-    parser.add_argument('--n_val', type=int, default=100, help="验证数据量")
+    parser.add_argument('--n_train', type=int, default=5000, help="训练数据量")
+    parser.add_argument('--n_val', type=int, default=1000, help="验证数据量")
     parser.add_argument('--flip_ratio', type=float, default=0.1, help="噪声比例 (0.0 - 1.0)")
     args = parser.parse_args()
 
@@ -260,8 +260,8 @@ def main():
 
     # --- Metric 1: F1-Rank (基于Top-K排序) ---
     # 模拟 helper.py 中的 kmeans_f1score(cluster=False)
-    # 逻辑：取最低分数的 10% 作为预测的最脏数据
-    threshold_rank = np.sort(sv)[int(0.1 * len(sv))]
+    # 逻辑：取最低分数的 "噪声比例" 作为预测的最脏数据
+    threshold_rank = np.sort(sv)[int(args.flip_ratio * len(sv))]
     pred_rank = np.zeros(len(sv))
     pred_rank[sv < threshold_rank] = 1
     f1_rank = f1_score(true_labels, pred_rank)
@@ -317,18 +317,18 @@ def main():
     acc_dirty = train_and_eval("Dirty (Full)", x_train, y_train, x_val, y_val)
     
     # Case 2: 随机剔除 (Random Baseline) - 作为对照组
-    # 模拟我们不知道哪些是脏的，随便删掉 10%
-    n_remove = int(len(sv) * 0.1) # 假设我们知道大概有10%的脏数据
+    # 模拟我们不知道哪些是脏的，随便删掉与噪声比例相当的数据
+    n_remove = int(len(sv) * args.flip_ratio) # 假设我们知道大概有多少比例的脏数据
     random_indices = np.random.choice(len(y_train), len(y_train) - n_remove, replace=False)
     acc_random = train_and_eval("Random Drop", x_train[random_indices], y_train[random_indices], x_val, y_val)
 
     # Case 3: 智能清洗 (Smart Cleaning by KNN-SV)
-    # 策略：剔除 Shapley Value 最低的 10% 数据
-    # 这里的阈值可以是固定的 10%，也可以用 KMeans 自动聚类得到
+    # 策略：根据预设的噪声比例剔除数据
+    # 这里的阈值可以是固定的 args.flip_ratio，也可以用 KMeans 自动聚类得到
     
-    # 策略 A: 剔除 Top-10% 最低分
+    # 策略 A: 剔除 Top-N% 最低分
     sorted_indices = np.argsort(sv)
-    keep_indices_rank = sorted_indices[n_remove:] # 保留分数靠前的 90%
+    keep_indices_rank = sorted_indices[n_remove:] # 保留分数靠前的部分
     acc_clean_rank = train_and_eval("Clean (Rank)", x_train[keep_indices_rank], y_train[keep_indices_rank], x_val, y_val)
 
     # 策略 B: 剔除 KMeans 聚类中的低分簇 (更加自动)
