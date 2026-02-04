@@ -8,3 +8,5 @@ softlabel-knnsv/OpenML_datasets/
 *.pkl
 *.tar.gz
 *.pth
+SFT/results/
+local_resources/
