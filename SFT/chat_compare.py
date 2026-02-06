@@ -58,29 +58,30 @@ def generate_response(model, tokenizer, instruction):
 
 def main():
     print("="*50)
-    print("🤖 SFT 模型对比对话系统 (Dirty vs Clean)")
+    print("🤖 SFT 模型全量对比系统 (Dirty vs Clean vs Oracle)")
     print("="*50)
 
     # 1. 检查模型文件是否存在
-    if not os.path.exists(DIRTY_PATH) or not os.path.exists(CLEAN_PATH):
-        print("⚠️ 警告：未找到模型文件！")
-        print(f"请检查路径:\n  {DIRTY_PATH}\n  {CLEAN_PATH}")
-        print("💡 提示：您之前的 sft_demo.py 可能没有保存模型，请重新运行一次 sft_demo.py")
-        return
+    models_to_load = [
+        ("Dirty Model (基线)", DIRTY_PATH, "dirty"),
+        ("Clean Model (你的算法)", CLEAN_PATH, "clean"),
+        ("Oracle Model (天花板)", ORACLE_PATH, "oracle")
+    ]
+    
+    loaded_models = {}
 
     # 2. 加载模型
-    # 考虑到显存，我们假设 6GB 能同时放下两个 0.5B 模型 (约 2-3GB)
-    # 如果爆显存，可以改成加载一个 -> 对话 -> 卸载 -> 加载另一个，但那样太慢
-    tk_dirty, model_dirty = load_model(DIRTY_PATH, "Dirty Model (脏数据训练)")
-    if not model_dirty: return
-    
-    tk_clean, model_clean = load_model(CLEAN_PATH, "Clean Model (清洗后训练)")
-    if not model_clean: return
-    
-    tk_oracle, model_oracle = load_model(ORACLE_PATH, "Oracle Model (原始纯净数据)")
-    # Oracle 可选，如果没有就不加载
-    if not model_oracle: 
-        print("⚠️ 提示：未找到 Oracle 模型，将只对比 Dirty vs Clean")
+    for name, path, key in models_to_load:
+        if os.path.exists(path):
+            tokenizer, model = load_model(path, name)
+            if model:
+                loaded_models[key] = (tokenizer, model)
+        else:
+            print(f"⚠️ 跳过 {name}: 路径不存在")
+
+    if not loaded_models:
+        print("❌ 没有加载到任何模型，请先运行 sft_demo.py 训练模型")
+        return
 
     print("\n✅ 模型加载完成！请输入问题进行测试 (输入 'q' 退出)")
     print("-" * 50)
@@ -95,20 +96,19 @@ def main():
             
         print("\n" + "-"*20 + " 生成中 " + "-"*20)
         
-        # 生成 Dirty
-        ans_dirty = generate_response(model_dirty, tk_dirty, query)
-        print(f"\n💩 Dirty Model (基线):\n{ans_dirty}")
+        # 依次生成回答
+        for name, path, key in models_to_load:
+            if key in loaded_models:
+                tokenizer, model = loaded_models[key]
+                try:
+                    ans = generate_response(model, tokenizer, query)
+                    # 使用不同的 emoji 区分
+                    icon = "💩" if key == "dirty" else ("✨" if key == "clean" else "🌟")
+                    print(f"\n{icon} {name}:\n{ans}")
+                except Exception as e:
+                    print(f"\n❌ {name} 生成出错: {e}")
         
-        # 生成 Clean
-        ans_clean = generate_response(model_clean, tk_clean, query)
-        print(f"\n✨ Clean Model (你的算法):\n{ans_clean}")
-        
-        # 生成 Oracle
-        if model_oracle:
-            ans_oracle = generate_response(model_oracle, tk_oracle, query)
-            print(f"\n🌟 Oracle Model (天花板):\n{ans_oracle}")
-        
-        print("\n" + "="*50)
+        print("-" * 50)
 
 if __name__ == "__main__":
     main()

@@ -313,7 +313,7 @@ def run_sft(dataset_list, output_name):
     # 加载模型 (FP32 模式加载，避免 16bit 溢出)
     model = AutoModelForCausalLM.from_pretrained(model_id, device_map="auto", torch_dtype=torch.float32)
     
-    # 启用 LoRA (关键！防崩神器)
+    # 启用 LoRA 
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM, 
         inference_mode=False, 
@@ -445,23 +445,22 @@ def main():
     # 这里对比：Dirty Full Set vs Cleaned Set
     
     # 5.1 训练 Dirty Model
+    import gc
+    torch.cuda.empty_cache()
+    gc.collect()
     loss_dirty, rouge_dirty = run_sft(raw_data, "dirty_model")
     
     # 5.2 训练 Clean Model
-    # 为了释放显存，建议在这里加入释放显存的代码，或者分脚本运行
-    # 这里演示，假设显存够用
     import gc
     torch.cuda.empty_cache()
     gc.collect()
-    
     loss_clean, rouge_clean = run_sft(cleaned_data, "clean_model")
     
     # 5.3 训练 Oracle Model (全干净数据 - 理论上限)
-    import gc
-    torch.cuda.empty_cache()
-    gc.collect()
-    
-    loss_oracle, rouge_oracle = run_sft(oracle_data, "oracle_model")
+    # 用户指示：已训练过 Oracle，直接使用上次结果，节省时间
+    print("⏩ 跳过 Oracle Model 训练 (已存在)...")
+    loss_oracle = 1.5928  # 上次运行记录
+    rouge_oracle = 0.1701 # 上次运行记录
     
     print("=" * 50)
     print("📊 最终实验结果")
