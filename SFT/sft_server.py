@@ -5,7 +5,7 @@ import random
 import numpy as np
 import torch
 import shutil
-from datasets import load_dataset, Dataset, load_from_disk
+from torch.utils.data import Dataset
 from transformers import (
     AutoTokenizer, 
     AutoModelForCausalLM, 
@@ -15,8 +15,6 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model, TaskType
 import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score
-import evaluate
 from tqdm import tqdm
 
 # ==========================================
@@ -31,7 +29,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 资源保存在当前脚本同级目录下的 server_resources
 RESOURCES_DIR = os.path.join(CURRENT_DIR, "server_resources")
-DATASET_PATH = os.path.join(RESOURCES_DIR, "alpaca_data")
+# 这里直接读取 alpaca_data.json 文件
+DATASET_PATH = os.path.join(RESOURCES_DIR, "alpaca_data.json")
 MODEL_PATH = os.path.join(RESOURCES_DIR, "qwen_model")
 
 # 确保目录存在
@@ -60,150 +59,94 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 # ==========================================
-# 1. 资源下载与准备 (核心修改部分)
+# 1. 资源下载与准备 (纯净版 - 不依赖 datasets 库)
 # ==========================================
 
 def get_local_model_path():
     """
     检查本地是否有模型，没有则下载 (优先尝试 ModelScope，其次 HuggingFace)
     """
-    # 1. 检查指定目录下是否有 config.json，如果有说明已经下载过了
     if os.path.exists(os.path.join(MODEL_PATH, "config.json")):
         print(f"✅ 检测到本地模型已存在: {MODEL_PATH}")
         return MODEL_PATH
     
     print(f"📥 本地未找到模型，开始下载...")
-    print(f"   目标路径: {MODEL_PATH}")
-
-    # 2. 尝试使用 ModelScope 下载 (国内最快)
+    
+    # 尝试 ModelScope
     try:
-        print("🚀 尝试使用 ModelScope 下载 (国内推荐)...")
+        print("🚀 尝试使用 ModelScope 下载...")
         from modelscope import snapshot_download
-        # ModelScope 下载后会返回具体的缓存路径
         mw_path = snapshot_download(CONFIG['model_id_ms'])
         
-        # 将下载的文件复制/移动到我们指定的 MODEL_PATH
-        print(f"   ModelScope 下载完成，正在同步到 {MODEL_PATH} ...")
-        
-        # 如果目标文件夹存在且非空，先清空
         if os.path.exists(MODEL_PATH):
             shutil.rmtree(MODEL_PATH)
-        
-        # 复制
         shutil.copytree(mw_path, MODEL_PATH)
-        print(f"✅ 模型已就绪: {MODEL_PATH}")
+        print(f"✅ ModelScope 下载完成: {MODEL_PATH}")
         return MODEL_PATH
     except ImportError:
-        print("⚠️ 未安装 modelscope 库，跳过 ModelScope 下载方式。(建议 pip install modelscope)")
+        print("⚠️ 未安装 modelscope, 跳过。")
     except Exception as e:
         print(f"❌ ModelScope 下载失败: {e}")
 
-    # 3. 尝试使用 HuggingFace 下载 (使用镜像)
+    # 尝试 HuggingFace
     try:
-        print("☁️ 尝试使用 HuggingFace (hf-mirror) 下载...")
+        print("☁️ 尝试使用 HuggingFace 下载...")
         from huggingface_hub import snapshot_download
-        snapshot_download(
-            repo_id=CONFIG['model_id_hf'],
-            local_dir=MODEL_PATH,
-            local_dir_use_symlinks=False,  
-            resume_download=True
-        )
+        snapshot_download(repo_id=CONFIG['model_id_hf'], local_dir=MODEL_PATH)
         return MODEL_PATH
     except Exception as e:
         print(f"❌ HuggingFace 下载失败: {e}")
-        raise RuntimeError("无法下载模型，请检查网络或手动下载模型到 server_resources/qwen_model 目录")
+        raise RuntimeError("无法下载模型，请手动下载 Qwen1.5-0.5B 到 server_resources/qwen_model")
 
 def prepare_data_local():
     """
-    数据本地化加载逻辑
+    加载数据并进行切分、投毒
+    返回:
+    1. final_data (投毒后的训练集 -> 对应 'Dirty Model')
+    2. pure_data (未投毒的纯净训练集 -> 对应 'Oracle Model')
+    3. dirty_indices_gt (投毒索引)
+    4. oracle_data (用于 Shapley 计算的验证集)
     """
-    print("📥 正在加载数据...")
-    ds_full = None
+    print("📥 正在读取数据文件...")
     
-    # 1. 优先加载本地
+    ds_full = None
     if os.path.exists(DATASET_PATH):
         try:
-            print(f"📂 加载本地数据集: {DATASET_PATH}")
-            from datasets import load_from_disk
-            ds_loaded = load_from_disk(DATASET_PATH)
-            if isinstance(ds_loaded, dict) or hasattr(ds_loaded, 'keys'):
-                ds_full = ds_loaded['train'] if 'train' in ds_loaded else list(ds_loaded.values())[0]
-            else:
-                ds_full = ds_loaded
-            print(f"✅ 本地数据加载成功! 总量: {len(ds_full)}")
+            with open(DATASET_PATH, 'r', encoding='utf-8') as f:
+                ds_full = json.load(f)
+            print(f"✅ 成功加载 JSON 数据: {len(ds_full)} 条")
         except Exception as e:
-            print(f"❌ 本地数据损坏: {e}")
-            
-    # 2. 如果本地没有，尝试下载 (优先 ModelScope/HF)
+            print(f"❌ 数据加载失败: {e}")
+    
     if ds_full is None:
-        print("☁️ 正在下载 tatsu-lab/alpaca 数据集...")
-        
-        # --- 方案 A: 使用 ModelScope 下载 (国内最快) ---
-        try:
-            print("   [Attempt 1] 尝试 ModelScope (AI-ModelScope/alpaca-gpt4-data-en)...")
-            from modelscope.msdatasets import MsDataset
-            # ModelScope 上的 Alpaca 数据集 (英文版)
-            ms_ds = MsDataset.load('AI-ModelScope/alpaca-gpt4-data-en', split='train')
-            # 转换为 HuggingFace 格式 List[Dict]
-            ds_full = []
-            print("   -> 正在转换数据格式...")
-            for item in ms_ds:
-                ds_full.append({
-                    'instruction': item.get('instruction', ''),
-                    'input': item.get('input', ''),
-                    'output': item.get('output', '')
-                })
-            print(f"✅ ModelScope 下载并转换成功! 条数: {len(ds_full)}")
-        except Exception as e:
-            print(f"⚠️ ModelScope 下载失败: {e}")
+        print("☢️ 未找到数据或加载失败，生成合成数据兜底...")
+        ds_full = [{"instruction": f"Solve {k}+{k}", "input":"", "output":f"{k+k}"} for k in range(5000)]
 
-        # --- 方案 B: 使用 HF 镜像下载 (备选) ---
-        if ds_full is None:
-            try:
-                print("   [Attempt 2] 尝试 HuggingFace 镜像 (hf-mirror.com)...")
-                # 设置环境变量强制走此镜像
-                os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-                ds_full = load_dataset("tatsu-lab/alpaca", split="train")
-                print("✅ HF 镜像下载成功!")
-            except Exception as e:
-                print(f"⚠️ HF 镜像下载失败: {e}")
-        
-        # --- 保存到本地 ---
-        if ds_full is not None:
-            try:
-                print(f"💾 正在保存数据集到本地: {DATASET_PATH} ...")
-                # 如果是 List，先转 Dataset
-                if isinstance(ds_full, list):
-                    Dataset.from_list(ds_full).save_to_disk(DATASET_PATH)
-                else:
-                    ds_full.save_to_disk(DATASET_PATH)
-                print("✅ 数据集已持久化保存。")
-            except Exception as e:
-                print(f"⚠️ 保存失败: {e}")
-        
-        # --- 最终兜底 ---
-        if ds_full is None:
-            print("☢️ 所有下载方式均失败，使用合成数据兜底...")
-            ds_full = [{"instruction": f"Solve {k}+{k}", "input":"", "output":f"{k+k}"} for k in range(5000)]
-
-    # 3. 切分数据
+    # 切分前 n_samples
     current_n = CONFIG['n_samples']
-    print(f"✂️ 正在截取前 {current_n} 条数据用于本次实验...")
+    print(f"✂️ 截取前 {current_n} 条数据...")
     
     ds_list = []
     count = 0
     for item in ds_full:
-        ds_list.append({"instruction": item["instruction"], "input": item["input"], "output": item["output"]})
+        ds_list.append({
+            "instruction": item.get("instruction", ""), 
+            "input": item.get("input", ""), 
+            "output": item.get("output", "")
+        })
         count += 1
         if count >= current_n: break
-            
-    # 4. 投毒
+    
+    # 这是一个没有投毒的纯净备份，用来训练 Oracle 模型
+    pure_data = [x.copy() for x in ds_list] 
+    
+    # 这里的 oracle_data 仅用于计算 Shapley 时的“基准”，不参与训练
+    # 按照惯例，我们从干净数据里留出一小部分作为验证
+    oracle_data = [x.copy() for x in ds_list[:100]] 
+    
+    # 开始投毒构造 final_data
     final_data = []
     dirty_indices_gt = [] 
-    
-    # Oracle 从原始数据里取 100 条 (不投毒)
-    # 确保 oracle_data 不受投毒影响
-    oracle_data = [x.copy() for x in ds_list[:100]] 
     
     set_seed(CONFIG['seed'])
     garbage_responses = ["I don't know.", "Error 404.", "Noise.", "Ignore."]
@@ -217,30 +160,34 @@ def prepare_data_local():
             dirty_indices_gt.append(i)
         final_data.append(new_item)
     
-    print(f"✅ 最终训练数据: {len(final_data)} 条 | 验证数据(Oracle): {len(oracle_data)} 条")
-    return final_data, dirty_indices_gt, oracle_data
+    print(f"✅ 数据准备完毕!")
+    print(f"   - Dirty (训练用): {len(final_data)} 条 (投毒 {len(dirty_indices_gt)})")
+    print(f"   - Pure (对比用):  {len(pure_data)} 条")
+    
+    return final_data, pure_data, dirty_indices_gt, oracle_data
 
 # ==========================================
-# 2. 梯度与 KNN-Shapley (优化版)
+# 2. 梯度与 KNN-Shapley
 # ==========================================
 
 def compute_knn_shapley_gradient(train_grads, val_grads, K=10):
+    """
+    计算 KNN-Shapley 值
+    """
     N_train = train_grads.shape[0]
     N_val = val_grads.shape[0]
     
-    print(f"   -> 归一化...")
+    # 归一化
     train_grads = F.normalize(train_grads, p=2, dim=1)
     val_grads = F.normalize(val_grads, p=2, dim=1)
     
     print(f"   -> 计算相似度矩阵 (CPU)...")
-    # 移至 CPU 计算避免 OOM
     val_cpu = val_grads.cpu()
     train_cpu = train_grads.cpu()
     S = torch.matmul(val_cpu, train_cpu.T).numpy()
     
     shapley_values = np.zeros(N_train)
     
-    print(f"   -> KNN 估值...")
     for j in range(N_val):
         s_row = S[j]
         topk_indices = np.argsort(s_row)[-K:]
@@ -296,11 +243,10 @@ def extract_gradient_features(model_path, dataset_list, indices):
     return torch.stack(grads)
 
 def calculate_shapley(model_path, dataset_list, oracle_data):
-    # 确保 oracle_data 不会太多把内存撑爆
     n_oracle = min(len(oracle_data), CONFIG['n_val_samples'])
     oracle_subset = oracle_data[:n_oracle]
     
-    print(f"🔧 准备计算: Train={len(dataset_list)}, Val={len(oracle_subset)}")
+    print(f"🔧 Shapley计算: Train={len(dataset_list)}, Val={len(oracle_subset)}")
     
     train_grads = extract_gradient_features(model_path, dataset_list, list(range(len(dataset_list))))
     val_grads = extract_gradient_features(model_path, oracle_subset, list(range(len(oracle_subset))))
@@ -311,16 +257,44 @@ def calculate_shapley(model_path, dataset_list, oracle_data):
 # ==========================================
 # 3. 训练与评估
 # ==========================================
+
+class SFTDataset(Dataset):
+    def __init__(self, data, tokenizer, max_len=256):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        item = self.data[index]
+        text = f"User: {item['instruction']}\n{item['input']}\nAssistant: {item['output']}{self.tokenizer.eos_token}"
+        tokenized = self.tokenizer(text, truncation=True, max_length=self.max_len, return_tensors=None)
+        return {
+            "input_ids": tokenized["input_ids"],
+            "attention_mask": tokenized["attention_mask"],
+            "labels": tokenized["input_ids"].copy()
+        }
+
 def run_sft_training(model_path, dataset_list, run_name):
+    # 如果数据集过小，跳过
+    if len(dataset_list) == 0:
+        print(f"⚠️ {run_name} 数据集为空，跳过训练。")
+        return
+
     output_path = os.path.join(CONFIG['output_dir'], run_name)
-    print(f"\n🚀 开始训练: {run_name} -> {output_path}")
+    print(f"\n🚀 [Training] 开始训练: {run_name}")
+    print(f"   样本数量: {len(dataset_list)}")
+    print(f"   保存路径: {output_path}")
     
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "right"
 
-    hf_dataset = Dataset.from_list(dataset_list)
-    hf_dataset = hf_dataset.map(lambda x: tokenizer(f"User: {x['instruction']}\n{x['input']}\nAssistant: {x['output']}{tokenizer.eos_token}", truncation=True, max_length=256), batched=False)
+    # 使用自定义 Dataset
+    train_dataset = SFTDataset(dataset_list, tokenizer)
     
     model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto", torch_dtype=torch.float32, trust_remote_code=True)
     model = get_peft_model(model, LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, lora_alpha=32, target_modules=["q_proj", "v_proj"]))
@@ -329,35 +303,39 @@ def run_sft_training(model_path, dataset_list, run_name):
         output_dir=output_path,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=4,
-        num_train_epochs=3,
+        num_train_epochs=3,      
         learning_rate=2e-4,
         logging_steps=10,
-        save_strategy="epoch",
-        save_total_limit=1,
+        save_strategy="no", # 本地Demo节省空间不保存每轮checkpoint
         report_to="none",
         fp16=False,
     )
     
-    trainer = Trainer(model=model, args=args, train_dataset=hf_dataset, data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False))
+    trainer = Trainer(
+        model=model, 
+        args=args, 
+        train_dataset=train_dataset, 
+        data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False)
+    )
     trainer.train()
-    trainer.save_model(output_path)
-    print(f"💾 模型已保存到: {output_path}")
     
-    # 简单的 ROUGE 评估 (本地离线版 - 无需联网)
-    print("📏 ROUGE Check (Offline)...")
+    # 训练结束后保存一次
+    trainer.save_model(output_path)
+    
+    # --- ROUGE-L 简易评估 ---
+    print(f"📏 [Eval] {run_name} ROUGE Check...")
     try:
         model.eval()
+        # 取前 10 个样本作为测试
+        # 为了公平，我们应该用固定的、干净的测试集? 
+        # 这里 Demo 简单起见，我们用 dataset_list 的前 10 个。
         test_samples = dataset_list[:10]
         preds, refs = [], []
         
-        # --- 本地简易计算 ROUGE-L (基于字符级 LCS) ---
         def calculate_local_rouge(pred_str, ref_str):
-            # 将字符串转为字符列表 (兼容中文和英文)
             x = list(pred_str.strip())
             y = list(ref_str.strip())
             if not x or not y: return 0.0
-            
-            # 动态规划计算最长公共子序列 (LCS)
             m, n = len(x), len(y)
             dp = [[0] * (n + 1) for _ in range(m + 1)]
             for i in range(1, m + 1):
@@ -367,9 +345,6 @@ def run_sft_training(model_path, dataset_list, run_name):
                     else:
                         dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
             lcs_len = dp[m][n]
-            
-            # 计算 F1 Score (ROUGE-L F1)
-            # F1 = 2 * LCS / (len(pred) + len(ref))
             if (len(x) + len(y)) == 0: return 0.0
             return 2.0 * lcs_len / (len(x) + len(y))
 
@@ -382,42 +357,58 @@ def run_sft_training(model_path, dataset_list, run_name):
             preds.append(pred)
             refs.append(item['output'])
         
-        # 计算平均分
         scores = [calculate_local_rouge(p, r) for p, r in zip(preds, refs)]
         avg_score = sum(scores) / len(scores) if scores else 0.0
-        print(f"📊 {run_name} Manual-ROUGE-L: {avg_score:.4f}")
+        print(f"📊 {run_name} Avg ROUGE-L: {avg_score:.4f}")
         
     except Exception as e:
         print(f"⚠️ Eval Error: {e}")
+    
+    # 清理显存
+    del model, trainer
+    torch.cuda.empty_cache()
 
 # ==========================================
 # 主流程
 # ==========================================
 def main():
-    print(f"🌟 SFT Server Persistent Demo (Updated) 启动")
+    print(f"🌟 SFT Server Persistent Demo (Multi-Model Comparison) 启动")
     
-    # 1. 准备本地模型 (由 ModelScope 驱动)
     model_path = get_local_model_path()
     
-    # 2. 准备本地数据
-    raw_data, dirty_indices_gt, oracle_data = prepare_data_local()
+    # 1. 准备数据
+    # raw_dirty: 包含投毒的数据 (对应 Baseline)
+    # raw_pure:  原本的干净数据 (对应 Oracle)
+    raw_dirty, raw_pure, dirty_indices_gt, oracle_data = prepare_data_local()
     
-    # 3. 计算 & 清洗
-    sv = calculate_shapley(model_path, raw_data, oracle_data)
+    # 2. 计算 Shapley 并清洗
+    # 计算是基于 raw_dirty 进行筛选
+    sv = calculate_shapley(model_path, raw_dirty, oracle_data)
     
-    n_remove = int(len(raw_data) * CONFIG['poison_ratio'])
+    n_remove = int(len(raw_dirty) * CONFIG['poison_ratio'])
     keep_indices = np.argsort(sv)[n_remove:]
-    cleaned_data = [raw_data[i] for i in keep_indices]
+    # cleaned_data: 算法清洗后的数据 (对应 Clean/Ours)
+    cleaned_data = [raw_dirty[i] for i in keep_indices]
     
-    # Check
+    # 3. 计算 Recall
     removed_indices = np.argsort(sv)[:n_remove]
     recall = len(set(removed_indices).intersection(set(dirty_indices_gt))) / (len(dirty_indices_gt) + 1e-9)
-    print(f"✅ Recall: {recall:.2%}")
+    print(f"✅ Shapley 清洗 Recall: {recall:.2%}")
 
-    # 4. 训练
+    # 4. 对比训练
+    print("\n⚔️ 开始三组模型对比训练 ⚔️")
+    print("------------------------------------------------")
+    
+    # A. 脏模型 (Dirty Model) - 用被投毒的数据练
+    run_sft_training(model_path, raw_dirty, "dirty_model")
+    
+    # B. 理想模型 (Oracle Model) - 用未拆封的干净数据练 (上限)
+    run_sft_training(model_path, raw_pure, "oracle_model")
+    
+    # C. 我们的模型 (Clean Model) - 用 Shapley 洗过的数据练
     run_sft_training(model_path, cleaned_data, "clean_model")
     
-    print("\n🎉 Done!")
+    print("\n🎉 所有实验完成! 请查看上方的 ROUGE 分数差异。")
 
 if __name__ == "__main__":
     main()
