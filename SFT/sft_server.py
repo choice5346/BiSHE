@@ -270,11 +270,29 @@ class SFTDataset(Dataset):
     def __getitem__(self, index):
         item = self.data[index]
         text = f"User: {item['instruction']}\n{item['input']}\nAssistant: {item['output']}{self.tokenizer.eos_token}"
-        tokenized = self.tokenizer(text, truncation=True, max_length=self.max_len, return_tensors=None)
+        
+        # 强制 Pad 到最大长度，避免 DataCollator 报错
+        tokenized = self.tokenizer(
+            text, 
+            truncation=True, 
+            padding="max_length", 
+            max_length=self.max_len, 
+            return_tensors="pt"
+        )
+        
+        # squeeze() 去掉 batch 维度 (1, L) -> (L)
+        input_ids = tokenized["input_ids"].squeeze(0)
+        attention_mask = tokenized["attention_mask"].squeeze(0)
+        
+        # 对于 Causal LM，labels 就是 input_ids
+        # 将 padding 部分的 label 设为 -100 (忽略计算 loss)
+        labels = input_ids.clone()
+        labels[attention_mask == 0] = -100
+        
         return {
-            "input_ids": tokenized["input_ids"],
-            "attention_mask": tokenized["attention_mask"],
-            "labels": tokenized["input_ids"].copy()
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels
         }
 
 def run_sft_training(model_path, dataset_list, run_name):
