@@ -307,13 +307,36 @@ def run_sft_training(model_path, dataset_list, run_name):
     trainer.save_model(output_path)
     print(f"💾 模型已保存到: {output_path}")
     
-    # 简单的 ROUGE 评估
-    print("📏 ROUGE Check...")
+    # 简单的 ROUGE 评估 (本地离线版 - 无需联网)
+    print("📏 ROUGE Check (Offline)...")
     try:
-        metric = evaluate.load("rouge")
         model.eval()
         test_samples = dataset_list[:10]
         preds, refs = [], []
+        
+        # --- 本地简易计算 ROUGE-L (基于字符级 LCS) ---
+        def calculate_local_rouge(pred_str, ref_str):
+            # 将字符串转为字符列表 (兼容中文和英文)
+            x = list(pred_str.strip())
+            y = list(ref_str.strip())
+            if not x or not y: return 0.0
+            
+            # 动态规划计算最长公共子序列 (LCS)
+            m, n = len(x), len(y)
+            dp = [[0] * (n + 1) for _ in range(m + 1)]
+            for i in range(1, m + 1):
+                for j in range(1, n + 1):
+                    if x[i - 1] == y[j - 1]:
+                        dp[i][j] = dp[i - 1][j - 1] + 1
+                    else:
+                        dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+            lcs_len = dp[m][n]
+            
+            # 计算 F1 Score (ROUGE-L F1)
+            # F1 = 2 * LCS / (len(pred) + len(ref))
+            if (len(x) + len(y)) == 0: return 0.0
+            return 2.0 * lcs_len / (len(x) + len(y))
+
         for item in test_samples:
             prompt = f"User: {item['instruction']}\n\nAssistant: "
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -322,8 +345,12 @@ def run_sft_training(model_path, dataset_list, run_name):
             pred = tokenizer.decode(outputs[0], skip_special_tokens=True).split("Assistant: ")[-1].strip()
             preds.append(pred)
             refs.append(item['output'])
-        scores = metric.compute(predictions=preds, references=refs)
-        print(f"📊 {run_name} ROUGE-L: {scores['rougeL']:.4f}")
+        
+        # 计算平均分
+        scores = [calculate_local_rouge(p, r) for p, r in zip(preds, refs)]
+        avg_score = sum(scores) / len(scores) if scores else 0.0
+        print(f"📊 {run_name} Manual-ROUGE-L: {avg_score:.4f}")
+        
     except Exception as e:
         print(f"⚠️ Eval Error: {e}")
 

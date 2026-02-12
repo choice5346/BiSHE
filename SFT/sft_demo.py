@@ -15,21 +15,14 @@ from transformers import (
     DataCollatorForLanguageModeling
 )
 from peft import LoraConfig, get_peft_model, TaskType
-
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics import f1_score, roc_auc_score, roc_curve, auc
+from torch.utils.data import DataLoader
+import torch.nn.functional as F
+from sklearn.metrics import roc_auc_score
 import evaluate
 from tqdm import tqdm
 
-# --- 核心算法导入 (复用之前的 KNN-Shapley) ---
-# 确保 helper.py 在上一级目录或 sys.path 中
-# helper.py 实际位于 d:\BiSHE\softlabel-knnsv\
-sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "softlabel-knnsv"))
-try:
-    from helper import knn_shapley_JW
-except ImportError:
-    print("❌ 错误：找不到 helper.py。请确保它都在 d:\\BiSHE\\helper.py")
-    sys.exit(1)
+# --- 核心算法导入: 移除 helper.py 依赖，改为本地实现 ---
+# sys.path.append ... (Removed)
 
 # ==========================================
 # 0. 全局配置
@@ -46,18 +39,12 @@ if not os.path.exists(model_path):
 else:
     print(f"✅ 使用本地 Qwen 模型: {model_path}")
 
-embed_path = os.path.join(LOCAL_RES_DIR, "embed_model")
-if not os.path.exists(embed_path):
-    embed_path = "all-MiniLM-L6-v2"
-    print("⚠️ 未找到本地 Embedding 模型，将使用云端下载模式")
-else:
-    print(f"✅ 使用本地 Embedding 模型: {embed_path}")
-
+# Feature Extractor 现在是 LLM 本身
 CONFIG = {
     "model_name": model_path,                # 目标 LLM
-    "embed_model": embed_path,               # 特征提取模型
-    "n_samples": 2000,                       # 总样本数 (模拟小样本实验)
-    "poison_ratio": 0.3,                     # 投毒比例 (30% 垃圾数据)
+    "n_samples": 2000,                       # 总样本数
+    "n_val_samples": 20,                     # ⚠️ 验证集大小 (取 Oracle 数据)
+    "poison_ratio": 0.3,                     # 投毒比例
     "output_dir": "SFT/results",             # 输出目录
     "seed": 42
 }
@@ -66,6 +53,8 @@ def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 # ==========================================
 # 1. 数据合成 (Data Synthesis)
@@ -160,130 +149,160 @@ def prepare_data():
     return data, dirty_indices, ds
 
 # ==========================================
-# 2. 特征提取 (Feature Extraction)
+# 2. 梯度特征提取与 KNN-Shapley (New)
 # ==========================================
-def extract_text_features(data_list):
-    """
-    使用 Sentence-Transformer 将 (Instruction + Input + Output) 转化为向量。
-    注意：这里我们把 Input 和 Output 拼在一起算特征，因为 KNN-SV 需要衡量 X 和 Y 的关系。
-    实际上在 SFT 中，X=Prompt, Y=Response。
-    我们将 "Prompt: ... Response: ..." 作为一个整体文本进行 Embedding。
-    """
-    print(f"🧠 正在提取文本特征 ({CONFIG['embed_model']})...")
-    model = SentenceTransformer(CONFIG['embed_model'])
-    
-    # 构造文本列表
-    texts = []
-    for item in data_list:
-        # 格式化文本: "Instruction: XXX\nInput: YYY\nOutput: ZZZ"
-        text = f"Instruction: {item['instruction']}\nInput: {item['input']}\nOutput: {item['output']}"
-        texts.append(text)
-        
-    # 批量计算 Embedding
-    embeddings = model.encode(texts, batch_size=32, show_progress_bar=True, convert_to_numpy=True)
-    
-    # L2 归一化 (关键！复用之前的经验)
-    # SentenceTransformer 默认通常已经归一化了，但为了保险再做一次
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    embeddings = embeddings / norms
-    
-    return embeddings
 
-# ==========================================
-# 3. 核心算法调用 (Valuation)
-# ==========================================
-def calculate_shapley(embeddings, dirty_indices):
+def compute_knn_shapley_gradient(train_grads, val_grads, K=10):
     """
-    调用 knn_shapley_JW 计算每个样本的价值。
-    注意：helper.py 里的函数需要 (x_train, y_train, x_val, y_val)。
-    但在无监督/自监督场景下，我们通常这么做：
-    1. 把数据切分为 Support Set (作为 'Train') 和 Query Set (作为 'Val')
-    2. 或者直接用 Leave-One-Out (KNN-SV 支持这种思想)
-    
-    为了适配 helper.py (它原本是为分类设计的，需要 label Y)，
-    我们这里做一个 **Trick**:
-    我们将 "Embedding" 视为 X，人为构造一个全是 1 的 Y (代表它们都属于'正类'任务)。
-    然后看哪些样本在 KNN 邻域里与其他样本 '格格不入' (即它的特征分布偏离了主流形)。
-    
-    或者更简单的：
-    我们将数据集随机切分 80% / 20%。
-    计算 80% 数据对 20% 数据的 KNN 贡献。
+    实现 knnsv-sft.md 中的算法。
     """
-    print("🔍 开始计算 KNN-Shapley 值...")
+    N_train = train_grads.shape[0]
+    N_val = val_grads.shape[0]
     
-    n_total = len(embeddings)
-    n_support = int(n_total * 0.8)
+    # 归一化梯度向量
+    print(f"   -> 正在归一化梯度向量...")
+    train_grads = F.normalize(train_grads, p=2, dim=1)
+    val_grads = F.normalize(val_grads, p=2, dim=1)
     
-    indices = np.random.permutation(n_total)
-    support_idx = indices[:n_support]
-    val_idx = indices[n_support:]
+    print(f"   -> 计算相似度矩阵 ({N_val}x{N_train})...")
+    # Move to CPU for numpy ops to save GPU memory
+    S = torch.matmul(val_grads, train_grads.T).cpu().numpy() 
     
-    x_support = embeddings[support_idx]
-    x_val = embeddings[val_idx]
+    shapley_values = np.zeros(N_train)
     
-    # 伪造 Label：在这个场景下，label 并不重要，我们关注的是特征一致性
-    # 但 helper.py 需要 label 匹配才能得分。
-    # 策略：我们假设所有数据都是 'Class 0'。KNN 会寻找最近的邻居。
-    # 如果一个脏数据混进来了，它的邻居可能比较远，或者它周围也是脏数据。
-    # 
-    # 等等，如果全是 Class 0，那么 helper.py 会认为所有邻居都是同类，都会加分。
-    # 这可能无法区分脏数据。
-    #
-    # 修正策略：
-    # 脏数据的特征语义通常与正常数据差异很大。
-    # 如果我们用 KNN 距离本身来衡量呢？
-    # KNN-Shapley 的本质是：如果把这个点加入，能不能提高对 Validation Set 的预测准确率。
-    # 这里我们没有 Label。
-    #
-    # 替代方案 -> **KNN Density (局部密度)** 
-    # 或者我们还是用 helper.py，但是构造一种特殊的任务？
-    #
-    # 让我们回退一步：
-    # 脏数据的 definition 是 "Instruction 和 Output 不匹配"。
-    # 而 Clean 数据是匹配的。
-    # 正常的 Sentence-Transformer 训练时使用了 Contrastive Loss。
-    # 所以 "问题+正确答案" 的向量，和 "问题+错误答案" 的向量，应该在空间中聚集在不同位置。
-    # 
-    # 鉴于我们必须复用 knn_shapley_JW，我们尝试构造一个 **Refrence Set (干净的小集合)**。
-    # 假设我们在实际应用中，手里总有那么 10-20 条人工写的完美数据。
-    # 我们把这 20 条当作 Validation Set (x_val, y_val=0)。
-    # 把待清洗数据当作 Training Set (x_train, y_train=0)。
-    # 看 x_train 里哪些样本对预测 x_val 有帮助 (即与 x_val 相似)。
-    # 这样，与完美数据相似的样本得分高，垃圾废话得分低。
-    pass 
+    # 预计算
+    print(f"   -> 运行递归算法 (K={K})...")
+    for j in tqdm(range(N_val), desc="Val Points"):
+        s_row = S[j]
+        sorted_indices = np.argsort(s_row)[::-1] # Descending
+        values = s_row[sorted_indices] # alpha
+        
+        # 简化版递归算法实现 (O(N))
+        # 根据 KNN-Shapley 论文，对于 Unweighted KNN (1/K * Sum(TopK)):
+        # phi_i = phi_{i+1} + (v_i - v_{i+1})/K * min(K, i) ? No.
+        
+        # 直接使用由 G-Shapley 推导出的系数 (Jia et al.)
+        # 对于 Utility = 1/K * Sum_{j=1}^K s_(j)
+        # Shapley Value phi_i = s_(i)/N + 1/K * (sum term)
+        # 让我们使用更直观的基于边际贡献的理解:
+        # 只有当前 N 个点中的 Top-K 发生变化时，Utility 才变。
+        
+        phi_sorted = np.zeros(N_train)
+        N = N_train
+        curr_K = min(K, N)
+        
+        # 倒序计算
+        for i in range(N - 1, -1, -1):
+            rank = i + 1 
+            val_diff = values[i] - (values[i+1] if i+1 < N else 0.0)
+            
+            if rank > curr_K:
+                phi_sorted[i] = 0 # 简化处理：K之后的点因为梯度相似度极低，贡献忽略
+            else:
+                # Top-K 贡献分配
+                phi_sorted[i] = phi_sorted[i+1] + val_diff / curr_K
+        
+        shapley_values[sorted_indices] += phi_sorted
+        
+    shapley_values /= N_val
+    return shapley_values
+
+def extract_gradient_features(model_name, dataset_list, indices):
+    """
+    计算指定样本的梯度向量。使用 LoRA 层的梯度。
+    """
+    print(f"🧬 正在提取梯度特征 (N={len(indices)})...")
     
-    # --- 实际实现 ---
-    # 这里的 Trick: 随机抽取 50 条样本，人工认定它们是干净的（或者我们在实验设定中已知 Clean Indicies）
-    # 在真实 SFT 场景中，通常确实会有一小部分 Golden Data。
-    # 我们从 clean_indices 中 "偷" 100 条作为 Validation Set。
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token
     
-    real_clean_idx = [i for i in range(n_total) if i not in dirty_indices]
-    random.shuffle(real_clean_idx)
-    # 取 100 条作为黄金验证集
-    gold_val_indices = real_clean_idx[:100]
+    model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto", torch_dtype=torch.float16)
     
-    # 剩下的作为待清洗池
-    candidate_indices = [i for i in range(n_total) if i not in gold_val_indices]
+    # 使用 LoRA 使得梯度更小更易计算
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM, inference_mode=False, r=8, lora_alpha=32, lora_dropout=0.1,
+        target_modules=["q_proj", "v_proj"]
+    )
+    model = get_peft_model(model, peft_config)
+    model.train() 
     
-    x_train = embeddings[candidate_indices]
-    y_train = np.zeros(len(x_train), dtype=int) # 假标签
+    grads = []
     
-    x_val = embeddings[gold_val_indices]
-    y_val = np.zeros(len(x_val), dtype=int)     # 假标签
+    def format_func(example):
+        text = f"User: {example['instruction']}\n{example['input']}\nAssistant: {example['output']}{tokenizer.eos_token}"
+        return text
+
+    subset = [dataset_list[i] for i in indices]
     
-    # 计算
-    sv = knn_shapley_JW(x_train, y_train, x_val, y_val, K=10)
+    for item in tqdm(subset, desc="Computing Gradients"):
+        text = format_func(item)
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512).to(model.device)
+        
+        outputs = model(**inputs, labels=inputs["input_ids"])
+        loss = outputs.loss
+        loss.backward()
+        
+        g_vecs = []
+        # 只提取最后一层 Decoder Layer 的 LoRA 参数梯度
+        num_layers = len(model.base_model.model.model.layers)
+        target_layer_idx = num_layers - 1
+        
+        found = False
+        for name, param in model.named_parameters():
+            if f"layers.{target_layer_idx}" in name and "lora_B" in name and param.grad is not None:
+                g_vecs.append(param.grad.view(-1).cpu().float()) # 转 float32
+                found = True
+        
+        if found:
+            grads.append(torch.cat(g_vecs))
+        else:
+            grads.append(torch.zeros(1))
+            
+        model.zero_grad()
     
-    # Debug: 打印 Shapley Value 的一些统计信息，防止全是 0
-    print(f"📊 Shapley Value Stats -> Mean: {np.mean(sv):.4f}, Std: {np.std(sv):.4f}, Max: {np.max(sv):.4f}, Min: {np.min(sv):.4f}")
+    # 清理内存
+    del model
+    torch.cuda.empty_cache()
     
-    # 我们需要把 sv 映射回原始 indices
-    full_sv = np.zeros(n_total)
-    full_sv[candidate_indices] = sv
-    # Golden Set 的样本给自己满分 (或者不做处理)
-    full_sv[gold_val_indices] = np.max(sv) 
+    # Pad if necessary (unlikely)
+    return torch.stack(grads)
+
+def calculate_shapley(dataset_list, dirty_indices, oracle_data):
+    """
+    Grad-SFT 流程：Raw Grads vs Oracle Grads
+    """
+    n_train = len(dataset_list)
+    n_val = CONFIG['n_val_samples']
     
-    return full_sv
+    # 从 Oracle 数据中取验证集
+    # 如果 oracle_data 不够 N_val，就取全部
+    n_val = min(len(oracle_data), n_val)
+    val_subset = oracle_data[:n_val]
+    val_indices = list(range(n_val))
+    
+    print(f"🔧 开始基于梯度的清洗流程...")
+    print(f"   Train: {n_train}, Val: {n_val}")
+    
+    # 1. 提取 Traing Gradients
+    train_indices = list(range(n_train))
+    print("   [1/2] Computing Train Gradients...")
+    train_grads = extract_gradient_features(CONFIG['model_name'], dataset_list, train_indices)
+    
+    # 2. 提取 Val Gradients
+    print("   [2/2] Computing Val (Oracle) Gradients...")
+    val_grads = extract_gradient_features(CONFIG['model_name'], val_subset, val_indices)
+    
+    # 维度对齐检查
+    if train_grads.shape[1] != val_grads.shape[1]:
+        print("❌ Gradient dimension mismatch!")
+        # 如果出错，返回随机值
+        return np.random.rand(n_train)
+
+    # 3. 计算 ES-Shapley
+    sv = compute_knn_shapley_gradient(train_grads, val_grads, K=10)
+    
+    print(f"📊 Gradient-Shapley Stats -> Mean: {np.mean(sv):.4e}, Std: {np.std(sv):.4e}")
+    return sv
 
 # ==========================================
 # 4. 微调训练 (Fine-tuning)
@@ -397,14 +416,11 @@ def main():
     # oracle_data: 未被污染的原始纯净数据 (上限/Gold Standard)
     raw_data, dirty_indices, oracle_data = prepare_data()
     
-    # 2. 提取特征
-    embeddings = extract_text_features(raw_data)
+    # 2. 计算价值 (Gradient-Shapley Value)
+    # 不再需要显式 extract_features，calculate_shapley 内部会做
+    sv = calculate_shapley(raw_data, dirty_indices, oracle_data)
     
-    # 3. 计算价值 (Shapley Value)
-    # 这一步我们用 "Golden Set Validation" 的策略
-    sv = calculate_shapley(embeddings, dirty_indices)
-    
-    # 4. 根据价值清洗
+    # 3. 根据价值清洗
     # 策略：我们要删掉 30% 左右的数据
     n_remove = int(len(raw_data) * CONFIG['poison_ratio'])
     
