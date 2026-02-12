@@ -136,18 +136,54 @@ def prepare_data_local():
             
     # 2. 如果本地没有，尝试下载 (优先 ModelScope/HF)
     if ds_full is None:
+        print("☁️ 正在下载 tatsu-lab/alpaca 数据集...")
+        
+        # --- 方案 A: 使用 ModelScope 下载 (国内最快) ---
         try:
-            print("☁️ 正在下载 tatsu-lab/alpaca 数据集...")
-            # 这里的下载逻辑：
-            # 如果 datasets 库能连上 HF 就直接下，连不上会报错
-            ds_full = load_dataset("tatsu-lab/alpaca", split="train")
-            
-            print(f"💾 正在保存数据集到本地: {DATASET_PATH} ...")
-            ds_full.save_to_disk(DATASET_PATH)
-            print("✅ 数据集已保存。")
+            print("   [Attempt 1] 尝试 ModelScope (AI-ModelScope/alpaca-gpt4-data-en)...")
+            from modelscope.msdatasets import MsDataset
+            # ModelScope 上的 Alpaca 数据集 (英文版)
+            ms_ds = MsDataset.load('AI-ModelScope/alpaca-gpt4-data-en', split='train')
+            # 转换为 HuggingFace 格式 List[Dict]
+            ds_full = []
+            print("   -> 正在转换数据格式...")
+            for item in ms_ds:
+                ds_full.append({
+                    'instruction': item.get('instruction', ''),
+                    'input': item.get('input', ''),
+                    'output': item.get('output', '')
+                })
+            print(f"✅ ModelScope 下载并转换成功! 条数: {len(ds_full)}")
         except Exception as e:
-            print(f"⚠️ 下载失败: {e}")
-            print("☢️ 使用合成数据兜底...")
+            print(f"⚠️ ModelScope 下载失败: {e}")
+
+        # --- 方案 B: 使用 HF 镜像下载 (备选) ---
+        if ds_full is None:
+            try:
+                print("   [Attempt 2] 尝试 HuggingFace 镜像 (hf-mirror.com)...")
+                # 设置环境变量强制走此镜像
+                os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+                ds_full = load_dataset("tatsu-lab/alpaca", split="train")
+                print("✅ HF 镜像下载成功!")
+            except Exception as e:
+                print(f"⚠️ HF 镜像下载失败: {e}")
+        
+        # --- 保存到本地 ---
+        if ds_full is not None:
+            try:
+                print(f"💾 正在保存数据集到本地: {DATASET_PATH} ...")
+                # 如果是 List，先转 Dataset
+                if isinstance(ds_full, list):
+                    Dataset.from_list(ds_full).save_to_disk(DATASET_PATH)
+                else:
+                    ds_full.save_to_disk(DATASET_PATH)
+                print("✅ 数据集已持久化保存。")
+            except Exception as e:
+                print(f"⚠️ 保存失败: {e}")
+        
+        # --- 最终兜底 ---
+        if ds_full is None:
+            print("☢️ 所有下载方式均失败，使用合成数据兜底...")
             ds_full = [{"instruction": f"Solve {k}+{k}", "input":"", "output":f"{k+k}"} for k in range(5000)]
 
     # 3. 切分数据
