@@ -405,7 +405,7 @@ def run_sft_training(model_path, dataset_list, run_name):
     
     args = TrainingArguments(
         output_dir=output_path,
-        per_device_train_batch_size=8,   # [Fix OOM] 降回 8，配合累积梯度
+        per_device_train_batch_size=8,   # [Fix OOM] 到8，配合累积梯度
         gradient_accumulation_steps=4,   # [Fix OOM] 8*4=32 等效 Batch Size
         num_train_epochs=3,      
         learning_rate=2e-4,
@@ -485,17 +485,17 @@ def main():
     raw_dirty, raw_pure, dirty_indices_gt, oracle_data = prepare_data_local()
     
     # ----------------------------------------------------
-    # [SpeedUp] 暂时跳过 Gradient-Shapley (非常耗时)
+    # 2. 计算 Gradient Shapley (Ours)
     # ----------------------------------------------------
-    # sv = calculate_shapley(model_path, raw_dirty, oracle_data)
+    sv = calculate_shapley(model_path, raw_dirty, oracle_data)
     
     n_remove = int(len(raw_dirty) * CONFIG['poison_ratio'])
-    # keep_indices = np.argsort(sv)[n_remove:]
-    # cleaned_data = [raw_dirty[i] for i in keep_indices]
+    keep_indices = np.argsort(sv)[n_remove:]
+    cleaned_data = [raw_dirty[i] for i in keep_indices]
     
-    # removed_indices = np.argsort(sv)[:n_remove]
-    # recall = len(set(removed_indices).intersection(set(dirty_indices_gt))) / (len(dirty_indices_gt) + 1e-9)
-    # print(f"✅ [Gradient] Shapley 清洗 Recall: {recall:.2%}")
+    removed_indices = np.argsort(sv)[:n_remove]
+    recall = len(set(removed_indices).intersection(set(dirty_indices_gt))) / (len(dirty_indices_gt) + 1e-9)
+    print(f"✅ [Gradient] Shapley 清洗 Recall: {recall:.2%}")
 
     # ==========================
     # 3.5 计算 RepSim 并清洗 (新增对照组: Mean & KNN)
@@ -520,17 +520,17 @@ def main():
     print(f"✅ [RepSim-KNN] 清洗 Recall: {recall_knn:.2%}")
 
     # 4. 对比训练
-    print("\n⚔️ [Focus Mode] 只训练 RepSim 对照组以便快速迭代 ⚔️")
+    print("\n⚔️ 开始五组模型对比训练 ⚔️")
     print("------------------------------------------------")
     
-    # [Skip] Dirty
-    # run_sft_training(model_path, raw_dirty, "dirty_model")
+    # A. 脏模型 (Dirty Model)
+    run_sft_training(model_path, raw_dirty, "dirty_model")
     
-    # [Skip] Oracle (作为 UpperBound 参考，也可以跳过)
-    # run_sft_training(model_path, raw_pure, "oracle_model")
+    # B. 理想模型 (Oracle Model)
+    run_sft_training(model_path, raw_pure, "oracle_model")
     
-    # [Skip] Gradient (Ours)
-    # run_sft_training(model_path, cleaned_data, "clean_model_gradient_knn")
+    # C. 我们的模型 (Clean Model - Gradient-KNN)
+    run_sft_training(model_path, cleaned_data, "clean_model_gradient_knn")
     
     # D. 对照模型 1 (Clean Model - RepSim Mean)
     run_sft_training(model_path, cleaned_data_repsim_mean, "clean_model_repsim_mean")
@@ -538,7 +538,7 @@ def main():
     # E. 对照模型 2 (Clean Model - RepSim KNN)
     run_sft_training(model_path, cleaned_data_repsim_knn, "clean_model_repsim_knn")
     
-    print("\n🎉 快速实验完成! 请比较上方两组 RepSim 的结果。")
+    print("\n🎉 所有实验完成! 请查看上方的 ROUGE 分数差异。")
 
 if __name__ == "__main__":
     main()
