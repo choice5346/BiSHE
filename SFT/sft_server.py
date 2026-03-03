@@ -24,6 +24,8 @@ from tqdm import tqdm
 # 设置 HF 镜像 (针对国内网络)
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# [Fix OOM] 启用内存碎片优化
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # 定义本地资源保存路径
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -403,15 +405,15 @@ def run_sft_training(model_path, dataset_list, run_name):
     
     args = TrainingArguments(
         output_dir=output_path,
-        per_device_train_batch_size=32,  # [SpeedUp] 从 4 增加到 32 (4090 显存充足)
-        gradient_accumulation_steps=1,   # [SpeedUp] 不需要累积了
+        per_device_train_batch_size=8,   # [Fix OOM] 降回 8，配合累积梯度
+        gradient_accumulation_steps=4,   # [Fix OOM] 8*4=32 等效 Batch Size
         num_train_epochs=3,      
         learning_rate=2e-4,
         logging_steps=10,
         save_strategy="no", 
         report_to="none",
-        fp16=True,                       # [SpeedUp] 开启混合精度训练
-        dataloader_num_workers=4,        # [SpeedUp] 增加数据加载线程
+        fp16=True,                       
+        dataloader_num_workers=2,        # [Fix] 减少 worker 防止多进程内存开销
     )
     
     trainer = Trainer(
