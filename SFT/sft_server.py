@@ -304,32 +304,39 @@ def calculate_shapley(model_path, dataset_list, oracle_data):
     min_len = min(train_grads.shape[1], val_grads.shape[1])
     return compute_knn_shapley_gradient(train_grads[:, :min_len], val_grads[:, :min_len], K=5)
 
-def calculate_repsim_score(model_path, dataset_list, oracle_data):
+def calculate_repsim_scores(model_path, dataset_list, oracle_data):
     """
-    计算 RepSim 分数
+    计算 RepSim 的两种分数 (一次提取，两种计算，高效对比)：
+    1. Mean Cosine Similarity (RepSim-Mean)
+    2. KNN-Shapley (RepSim-KNN)
     """
     n_oracle = min(len(oracle_data), CONFIG['n_val_samples'])
     oracle_subset = oracle_data[:n_oracle]
     
-    print(f"🧩 RepSim计算 (Feature-based): Train={len(dataset_list)}, Val={len(oracle_subset)}")
+    print(f"🧩 提取特征 (RepSim)... Train={len(dataset_list)}, Val={len(oracle_subset)}")
     
-    # 1. 提取特征
+    # 1. 提取特征 (Input X Vector，只提取一次)
     train_reps = extract_representation_features(model_path, dataset_list, list(range(len(dataset_list))))
     val_reps = extract_representation_features(model_path, oracle_subset, list(range(len(oracle_subset))))
     
-    # 2. 归一化
-    train_reps = F.normalize(train_reps, p=2, dim=1)
-    val_reps = F.normalize(val_reps, p=2, dim=1)
+    # ensure float32
+    train_reps = train_reps.float()
+    val_reps = val_reps.float()
+
+    # 2. 计算 RepSim-Mean (Feature-based Mean Cosine)
+    print(f"   -> [1/2] 计算 RepSim-Mean (Cosine)...")
+    train_norm = F.normalize(train_reps, p=2, dim=1)
+    val_norm = F.normalize(val_reps, p=2, dim=1)
+    sim_matrix = torch.matmul(train_norm, val_norm.T)
+    scores_mean = sim_matrix.mean(dim=1).numpy()
+
+    # 3. 计算 RepSim-KNN (Feature-based KNN Shapley)
+    print(f"   -> [2/2] 计算 RepSim-KNN (Shapley)...")
+    min_dim = min(train_reps.shape[1], val_reps.shape[1])
+    #复用通用的 KNN 算子，输入 Feature
+    scores_knn = compute_knn_shapley_gradient(train_reps[:, :min_dim], val_reps[:, :min_dim], K=5)
     
-    # 3. 计算 Cosine Similarity 矩阵
-    # sim_matrix[i][j] 表示 第 i 个训练样本 和 第 j 个验证样本 的相似度
-    sim_matrix = torch.matmul(train_reps, val_reps.T)
-    
-    # 4. 计算平均相似度 (Mean Cosine Similarity)
-    # 对于每个训练样本，计算它和所有验证样本的平均相似度
-    scores = sim_matrix.mean(dim=1).numpy()
-    
-    return scores
+    return scores_mean, scores_knn
 
 # ==========================================
 # 3. 训练与评估
@@ -491,22 +498,29 @@ def main():
     print(f"✅ [Gradient] Shapley 清洗 Recall: {recall:.2%}")
 
     # ==========================
-    # 3.5 计算 RepSim 并清洗 (新增对照组)
+    # 3.5 计算 RepSim 并清洗 (新增对照组: Mean & KNN)
     # ==========================
-    repsim_scores = calculate_repsim_score(model_path, raw_dirty, oracle_data)
+    # 一次性计算两种特征基准分数
+    repsim_scores_mean, repsim_scores_knn = calculate_repsim_scores(model_path, raw_dirty, oracle_data)
     
-    # RepSim 分数越高越好(相似度高)，越低越差
-    # 所以要剔除分数低的 (argsort 默认从小到大，所以取前面的剔除)
-    keep_indices_repsim = np.argsort(repsim_scores)[n_remove:]
-    cleaned_data_repsim = [raw_dirty[i] for i in keep_indices_repsim]
+    # --- A. RepSim - Mean ---
+    keep_indices_mean = np.argsort(repsim_scores_mean)[n_remove:]
+    cleaned_data_repsim_mean = [raw_dirty[i] for i in keep_indices_mean]
     
-    # Check Recall for RepSim
-    removed_indices_repsim = np.argsort(repsim_scores)[:n_remove]
-    recall_repsim = len(set(removed_indices_repsim).intersection(set(dirty_indices_gt))) / (len(dirty_indices_gt) + 1e-9)
-    print(f"✅ [RepSim] 清洗 Recall: {recall_repsim:.2%}")
+    removed_indices_mean = np.argsort(repsim_scores_mean)[:n_remove]
+    recall_mean = len(set(removed_indices_mean).intersection(set(dirty_indices_gt))) / (len(dirty_indices_gt) + 1e-9)
+    print(f"✅ [RepSim-Mean] 清洗 Recall: {recall_mean:.2%}")
+
+    # --- B. RepSim - KNN ---
+    keep_indices_knn = np.argsort(repsim_scores_knn)[n_remove:]
+    cleaned_data_repsim_knn = [raw_dirty[i] for i in keep_indices_knn]
+    
+    removed_indices_knn = np.argsort(repsim_scores_knn)[:n_remove]
+    recall_knn = len(set(removed_indices_knn).intersection(set(dirty_indices_gt))) / (len(dirty_indices_gt) + 1e-9)
+    print(f"✅ [RepSim-KNN] 清洗 Recall: {recall_knn:.2%}")
 
     # 4. 对比训练
-    print("\n⚔️ 开始四组模型对比训练 ⚔️")
+    print("\n⚔️ 开始五组模型对比训练 ⚔️")
     print("------------------------------------------------")
     
     # A. 脏模型 (Dirty Model)
@@ -515,11 +529,14 @@ def main():
     # B. 理想模型 (Oracle Model)
     run_sft_training(model_path, raw_pure, "oracle_model")
     
-    # C. 我们的模型 (Clean Model - Gradient)
-    run_sft_training(model_path, cleaned_data, "clean_model_gradient")
+    # C. 我们的模型 (Clean Model - Gradient-KNN)
+    run_sft_training(model_path, cleaned_data, "clean_model_gradient_knn")
     
-    # D. 对照模型 (Clean Model - RepSim)
-    run_sft_training(model_path, cleaned_data_repsim, "clean_model_repsim")
+    # D. 对照模型 1 (Clean Model - RepSim Mean)
+    run_sft_training(model_path, cleaned_data_repsim_mean, "clean_model_repsim_mean")
+    
+    # E. 对照模型 2 (Clean Model - RepSim KNN)
+    run_sft_training(model_path, cleaned_data_repsim_knn, "clean_model_repsim_knn")
     
     print("\n🎉 所有实验完成! 请查看上方的 ROUGE 分数差异。")
 
