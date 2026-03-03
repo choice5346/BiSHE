@@ -242,17 +242,94 @@ def extract_gradient_features(model_path, dataset_list, indices):
     if not grads: return torch.zeros((len(indices), 1))
     return torch.stack(grads)
 
+def extract_representation_features(model_path, dataset_list, indices):
+    """
+    [New] RepSim 方法：提取特征表示 (Last Token Hidden State)
+    """
+    print(f"🧠 提取特征表示 (RepSim)... 样本数: {len(indices)}")
+    
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+    
+    # 注意：提取特征不需要 Peft/LoRA，只需要 Base Model
+    # 因为我们看的是“预训练模型认为这两句话像不像”
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, 
+        device_map="auto", 
+        torch_dtype=torch.float16, 
+        trust_remote_code=True
+    )
+    model.eval()
+    
+    reps = []
+    subset = [dataset_list[i] for i in indices]
+    MAX_LEN = 256
+    
+    with torch.no_grad():
+        for item in tqdm(subset, desc="Reps"):
+            text = f"User: {item['instruction']}\n{item['input']}\nAssistant: {item['output']}{tokenizer.eos_token}"
+            inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=MAX_LEN).to(model.device)
+            
+            # output_hidden_states=True
+            outputs = model(**inputs, output_hidden_states=True)
+            
+            # 取最后一层 (Last Hidden State)
+            # shape: (1, seq_len, hidden_dim)
+            last_hidden_state = outputs.hidden_states[-1]
+            
+            # 取最后一个有效 Token 的向量 (EOS 这里)
+            # inputs['attention_mask'] 是 (1, seq_len)
+            # 找到最后一个 1 的位置
+            seq_len = inputs['attention_mask'].sum(dim=1) - 1
+            # shape: (1, hidden_dim) -> (hidden_dim)
+            last_token_rep = last_hidden_state[0, seq_len[0], :].float().cpu() # 转 float32
+            
+            reps.append(last_token_rep)
+    
+    del model
+    torch.cuda.empty_cache()
+    
+    if not reps: return torch.zeros((len(indices), 1))
+    return torch.stack(reps)
+
 def calculate_shapley(model_path, dataset_list, oracle_data):
     n_oracle = min(len(oracle_data), CONFIG['n_val_samples'])
     oracle_subset = oracle_data[:n_oracle]
     
-    print(f"🔧 Shapley计算: Train={len(dataset_list)}, Val={len(oracle_subset)}")
+    print(f"🔧 Shapley计算 (Gradient-based): Train={len(dataset_list)}, Val={len(oracle_subset)}")
     
     train_grads = extract_gradient_features(model_path, dataset_list, list(range(len(dataset_list))))
     val_grads = extract_gradient_features(model_path, oracle_subset, list(range(len(oracle_subset))))
     
     min_len = min(train_grads.shape[1], val_grads.shape[1])
     return compute_knn_shapley_gradient(train_grads[:, :min_len], val_grads[:, :min_len], K=5)
+
+def calculate_repsim_score(model_path, dataset_list, oracle_data):
+    """
+    计算 RepSim 分数
+    """
+    n_oracle = min(len(oracle_data), CONFIG['n_val_samples'])
+    oracle_subset = oracle_data[:n_oracle]
+    
+    print(f"🧩 RepSim计算 (Feature-based): Train={len(dataset_list)}, Val={len(oracle_subset)}")
+    
+    # 1. 提取特征
+    train_reps = extract_representation_features(model_path, dataset_list, list(range(len(dataset_list))))
+    val_reps = extract_representation_features(model_path, oracle_subset, list(range(len(oracle_subset))))
+    
+    # 2. 归一化
+    train_reps = F.normalize(train_reps, p=2, dim=1)
+    val_reps = F.normalize(val_reps, p=2, dim=1)
+    
+    # 3. 计算 Cosine Similarity 矩阵
+    # sim_matrix[i][j] 表示 第 i 个训练样本 和 第 j 个验证样本 的相似度
+    sim_matrix = torch.matmul(train_reps, val_reps.T)
+    
+    # 4. 计算平均相似度 (Mean Cosine Similarity)
+    # 对于每个训练样本，计算它和所有验证样本的平均相似度
+    scores = sim_matrix.mean(dim=1).numpy()
+    
+    return scores
 
 # ==========================================
 # 3. 训练与评估
@@ -411,20 +488,38 @@ def main():
     # 3. 计算 Recall
     removed_indices = np.argsort(sv)[:n_remove]
     recall = len(set(removed_indices).intersection(set(dirty_indices_gt))) / (len(dirty_indices_gt) + 1e-9)
-    print(f"✅ Shapley 清洗 Recall: {recall:.2%}")
+    print(f"✅ [Gradient] Shapley 清洗 Recall: {recall:.2%}")
+
+    # ==========================
+    # 3.5 计算 RepSim 并清洗 (新增对照组)
+    # ==========================
+    repsim_scores = calculate_repsim_score(model_path, raw_dirty, oracle_data)
+    
+    # RepSim 分数越高越好(相似度高)，越低越差
+    # 所以要剔除分数低的 (argsort 默认从小到大，所以取前面的剔除)
+    keep_indices_repsim = np.argsort(repsim_scores)[n_remove:]
+    cleaned_data_repsim = [raw_dirty[i] for i in keep_indices_repsim]
+    
+    # Check Recall for RepSim
+    removed_indices_repsim = np.argsort(repsim_scores)[:n_remove]
+    recall_repsim = len(set(removed_indices_repsim).intersection(set(dirty_indices_gt))) / (len(dirty_indices_gt) + 1e-9)
+    print(f"✅ [RepSim] 清洗 Recall: {recall_repsim:.2%}")
 
     # 4. 对比训练
-    print("\n⚔️ 开始三组模型对比训练 ⚔️")
+    print("\n⚔️ 开始四组模型对比训练 ⚔️")
     print("------------------------------------------------")
     
-    # A. 脏模型 (Dirty Model) - 用被投毒的数据练
+    # A. 脏模型 (Dirty Model)
     run_sft_training(model_path, raw_dirty, "dirty_model")
     
-    # B. 理想模型 (Oracle Model) - 用未拆封的干净数据练 (上限)
+    # B. 理想模型 (Oracle Model)
     run_sft_training(model_path, raw_pure, "oracle_model")
     
-    # C. 我们的模型 (Clean Model) - 用 Shapley 洗过的数据练
-    run_sft_training(model_path, cleaned_data, "clean_model")
+    # C. 我们的模型 (Clean Model - Gradient)
+    run_sft_training(model_path, cleaned_data, "clean_model_gradient")
+    
+    # D. 对照模型 (Clean Model - RepSim)
+    run_sft_training(model_path, cleaned_data_repsim, "clean_model_repsim")
     
     print("\n🎉 所有实验完成! 请查看上方的 ROUGE 分数差异。")
 
