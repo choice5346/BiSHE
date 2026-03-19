@@ -7,6 +7,7 @@ import torchvision
 import torchvision.transforms as transforms
 from sklearn.metrics import roc_auc_score, f1_score
 from sklearn.cluster import KMeans
+from sklearn.linear_model import LogisticRegression
 import time
 import argparse
 from tqdm import tqdm
@@ -84,16 +85,29 @@ def extract_features(data_loader, feature_type: str):
     print(f"🧠 正在使用 {feature_type} 提取特征...")
     model, _ = build_backbone(feature_type)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # 🌟 使用 DataParallel 多卡并行!
+    if torch.cuda.device_count() > 1:
+        print(f"🚀 利用 {torch.cuda.device_count()} 块 GPU 进行特征提取")
+        model = nn.DataParallel(model)
+        
     model = model.to(device)
     model.eval()
 
     features_list = []
+    # 使用混合精度加速 (fp16)
+    scaler = torch.cuda.amp.GradScaler() 
+    
     with torch.no_grad():
         for inputs, _ in tqdm(data_loader, desc=f"Extraction"):
-            inputs = inputs.to(device)
-            outputs = model(inputs)
-            # L2 归一化，这对 KNN 尤其重要
-            outputs = torch.nn.functional.normalize(outputs, p=2, dim=1)
+            inputs = inputs.to(device, non_blocking=True)
+            
+            # 开启自动混合精度以加速
+            with torch.cuda.amp.autocast():
+                outputs = model(inputs)
+                # L2 归一化，这对 KNN 尤其重要
+                outputs = torch.nn.functional.normalize(outputs, p=2, dim=1)
+                
             features_list.append(outputs.cpu().numpy())
 
     return np.concatenate(features_list, axis=0)
@@ -125,10 +139,17 @@ def get_cifar_dog_cat_data(n_train=2000, n_val=500, flip_ratio=0.1, feature_type
     # 下载/加载 CIFAR-10
     try:
         # train=True 包含 50000 张图
+        # 如果 download=True, torchvision 内部会自动检查文件是否存在和完整性 (check_integrity)
+        # 只要本地文件完好，它就不会重复下载，而是直接显示 "Files already downloaded and verified"
         full_dataset = torchvision.datasets.CIFAR10(root=DATA_DIR, train=True, download=True, transform=transform)
     except Exception as e:
-        print(f"❌ 数据下载失败: {e}\n请检查网络连接或手动下载 CIFAR-10 到 {DATA_DIR}")
-        return None
+        print(f"❌ 数据加载失败: {e}")
+        # 尝试 download=False 强行加载
+        try:
+            full_dataset = torchvision.datasets.CIFAR10(root=DATA_DIR, train=True, download=False, transform=transform)
+        except Exception as e2:
+            print(f"❌ 再次尝试加载失败: {e2}")
+            return None
 
     # --- 筛选 Cat (3) 和 Dog (5) ---
     # CIFAR-10 classes: 
@@ -178,11 +199,13 @@ def get_cifar_dog_cat_data(n_train=2000, n_val=500, flip_ratio=0.1, feature_type
     
     print(f"✅ 数据集就绪: 训练集 {len(y_train)} (Cat:{np.sum(y_train==0)}/Dog:{np.sum(y_train==1)}), 验证集 {len(y_val)}")
 
-    # --- 重度计算：特征提取 ---
-    batch_size = 64
+    # --- 重度计算：特征提取 (Multi-GPU/Batch Size 优化) ---
+    batch_size = 256 # 🚀 加大 Batch Size 以充分利用服务器算力
+    num_workers = 4 # 多线程加载数据
+    
     if feature_type != 'raw':
-        train_loader = torch.utils.data.DataLoader(train_subset, batch_size=batch_size, shuffle=False)
-        val_loader = torch.utils.data.DataLoader(val_subset, batch_size=batch_size, shuffle=False)
+        train_loader = torch.utils.data.DataLoader(train_subset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+        val_loader = torch.utils.data.DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
         
         x_train = extract_features(train_loader, feature_type)
         x_val = extract_features(val_loader, feature_type)
@@ -301,6 +324,81 @@ def main():
         print("👍 检测效果良好。")
     else:
         print("⚠️ 检测效果一般，可能特征不够强或噪声太难区分。")
+
+    # ==========================================
+    # 4. 下游任务应用：数据清洗后的模型重训练
+    # ==========================================
+    print("\n🏭 [下游任务验证]：清洗数据是否能提升模型性能？")
+    print("-" * 60)
+    
+    def train_and_eval(name, x_tr, y_tr, x_v, y_v):
+        """训练一个简单的线性分类器 (Linear Probing) 并评估准确率"""
+        if len(x_tr) == 0:
+            print(f"   ► [{name:<15}] (Skipped: No data)")
+            return 0.0
+            
+        # 使用 sklearn 的 LogisticRegression 作为分类头
+        # 增加 max_iter 防止不收敛
+        clf = LogisticRegression(solver='liblinear', C=1.0, max_iter=2000, random_state=42)
+        clf.fit(x_tr, y_tr)
+        acc = clf.score(x_v, y_v)
+        print(f"   ► [{name:<15}] Val Acc: {acc:.2%} (Samples: {len(x_tr)})")
+        return acc
+
+    # Case 1: 原始脏数据训练 (Baseline)
+    acc_dirty = train_and_eval("Dirty (Full)", x_train, y_train, x_val, y_val)
+    
+    # Case 2: 随机剔除 (Random Baseline) - 作为对照组
+    # 模拟我们不知道哪些是脏的，随便删掉与噪声比例相当的数据
+    n_remove = int(len(sv) * args.flip_ratio) # 假设我们知道大概有多少比例的脏数据
+    if n_remove > 0:
+        random_indices = np.random.choice(len(y_train), len(y_train) - n_remove, replace=False)
+        x_random_train = x_train[random_indices]
+        y_random_train = y_train[random_indices]
+        acc_random = train_and_eval("Random Drop", x_random_train, y_random_train, x_val, y_val)
+    else:
+        acc_random = acc_dirty
+
+    # Case 3: 智能清洗 (Smart Cleaning by KNN-SV)
+    # 策略 A: 剔除 Top-N% 最低分
+    # 注意：sv 越低越可能是脏数据，所以我们按照从小到大排序，丢弃前面的
+    sorted_indices = np.argsort(sv)
+    keep_indices_rank = sorted_indices[n_remove:] # 保留分数靠后的部分（高分部分）
+    acc_clean_rank = train_and_eval(f"Clean (Top-{args.flip_ratio:.0%})", x_train[keep_indices_rank], y_train[keep_indices_rank], x_val, y_val)
+
+    # 策略 B: 剔除 KMeans 聚类中的低分簇 (更加自动)
+    if len(np.unique(sv)) > 1:
+        X_sv = sv.reshape(-1, 1)
+        kmeans = KMeans(n_clusters=2, random_state=42, n_init=10).fit(X_sv)
+        
+        # 找到两个簇的中心
+        centers = kmeans.cluster_centers_.flatten()
+        # 找到中心较小的那个簇的标签 (认为是脏数据簇)
+        dirty_cluster_label = np.argmin(centers)
+        
+        # 保留那些不属于脏数据簇的样本
+        # kmeans.labels_ == dirty_cluster_label -> 脏数据
+        # kmeans.labels_ != dirty_cluster_label -> 干净数据
+        keep_mask = (kmeans.labels_ != dirty_cluster_label)
+        keep_indices_cluster = np.where(keep_mask)[0]
+        
+        # 如果 KMeans 把所有数据都当成脏的了（异常情况），就不使用
+        if len(keep_indices_cluster) < 10:
+             # 回退到全数据，或者只用 rank 策略
+             acc_clean_cluster = 0.0
+        else:
+            acc_clean_cluster = train_and_eval("Clean (Auto)", x_train[keep_indices_cluster], y_train[keep_indices_cluster], x_val, y_val)
+    else:
+        acc_clean_cluster = 0.0
+
+    print("-" * 60)
+    best_clean_acc = max(acc_clean_rank, acc_clean_cluster)
+    improvement = best_clean_acc - acc_dirty
+    
+    if improvement > 0.001:
+        print(f"✅ 成功验证！通过删除有害数据，模型精度提升了 +{improvement:.2%}")
+    else:
+        print(f"⚖️ 提升不明显 (Diff: {improvement:+.2%})。可能是模型鲁棒性太强，或者噪声影响有限。")
 
 if __name__ == "__main__":
     main()
