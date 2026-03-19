@@ -59,6 +59,19 @@ def build_backbone(feature_type: str):
         model = torchvision.models.efficientnet_b0(pretrained=True)
         model.classifier = nn.Identity()
         out_dim = 1280
+    elif feature_type == 'densenet121':
+        model = torchvision.models.densenet121(pretrained=True)
+        model.classifier = nn.Identity()
+        out_dim = 1024
+    elif feature_type == 'convnext_tiny':
+        model = torchvision.models.convnext_tiny(pretrained=True)
+        # ConvNeXt 的 classifier 包含 Flatten，所以我们要保留 Flatten(1)
+        model.classifier = nn.Flatten(1)
+        out_dim = 768
+    elif feature_type == 'vit_b_16':
+        model = torchvision.models.vit_b_16(pretrained=True)
+        model.heads = nn.Identity()
+        out_dim = 768
     else:
         # 默认回退
         print(f"⚠️ 未知模型 {feature_type}, 使用 ResNet18 作为默认")
@@ -202,7 +215,8 @@ def get_cifar_dog_cat_data(n_train=2000, n_val=500, flip_ratio=0.1, feature_type
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--feature_type', type=str, default='resnet18', 
-                        choices=['raw', 'resnet18', 'resnet50', 'vgg11', 'mobilenet_v2', 'efficientnet_b0'],
+                        choices=['raw', 'resnet18', 'resnet50', 'vgg11', 'mobilenet_v2', 'densenet121', 
+                                 'efficientnet_b0', 'convnext_tiny', 'vit_b_16'],
                         help="特征提取器模型")
     parser.add_argument('--n_train', type=int, default=2000, help="训练样本数")
     parser.add_argument('--n_val', type=int, default=500, help="验证样本数")
@@ -250,20 +264,35 @@ def main():
     # 我们希望脏数据的 Shapley Value 很低（负贡献），所以 -sv 应该很高
     auc = roc_auc_score(true_dirty_mask, -sv)
     
-    # Metric: F1 (假设我们要检测出 Top-N% 最差的数据)
+    # --- Metric 1: F1-Rank (基于Top-K排序) ---
     # 取全部数据的 flip_ratio 比例作为切分点
     cutoff_k = int(len(sv) * args.flip_ratio)
     # 找到分数最低的 cutoff_k 个数据的阈值
-    threshold = np.partition(sv, cutoff_k)[cutoff_k]
-    
-    pred_dirty = np.zeros(len(sv))
-    pred_dirty[sv <= threshold] = 1
-    
-    f1 = f1_score(true_dirty_mask, pred_dirty)
-    
+    if cutoff_k > 0:
+        threshold_rank = np.sort(sv)[cutoff_k]
+        pred_rank = np.zeros(len(sv))
+        pred_rank[sv < threshold_rank] = 1
+        f1_rank = f1_score(true_dirty_mask, pred_rank)
+    else:
+        f1_rank = 0.0
+
+    # --- Metric 2: F1-Cluster (基于KMeans聚类) ---
+    # 逻辑：用 KMeans 把分数聚成2类，中心较低的那一类作为脏数据
+    if len(np.unique(sv)) > 1: # 防止所有分数都一样导致kmeans报错
+        X = sv.reshape(-1, 1)
+        kmeans = KMeans(n_clusters=2, random_state=0, n_init=10).fit(X)
+        min_cluster_center = min(kmeans.cluster_centers_.flatten())
+        pred_cluster = np.zeros(len(sv))
+        # 只要小于这个中心的样本都被视为脏数据 (模仿 helper.py 的逻辑)
+        pred_cluster[sv < min_cluster_center] = 1
+        f1_cluster = f1_score(true_dirty_mask, pred_cluster)
+    else:
+        f1_cluster = 0.0
+
     print(f"Detection Performance (Task: Find {len(dirty_indices)} flipped labels)")
-    print(f" -> AUROC : {auc:.4f} (越高越好, 1.0完美)")
-    print(f" -> F1    : {f1:.4f}  (Top-{args.flip_ratio:.0%} cutoff)")
+    print(f" -> AUROC      : {auc:.4f}")
+    print(f" -> F1-Rank    : {f1_rank:.4f} (Top-{args.flip_ratio:.0%} cutoff)")
+    print(f" -> F1-Cluster : {f1_cluster:.4f} (KMeans cutoff)")
     print("-" * 60)
     
     if auc > 0.9:
