@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import random
+import argparse
 import numpy as np
 import torch
 import shutil
@@ -33,6 +34,7 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESOURCES_DIR = os.path.join(CURRENT_DIR, "server_resources")
 # 这里直接读取 alpaca_data.json 文件
 DATASET_PATH = os.path.join(RESOURCES_DIR, "alpaca_data.json")
+DATASETS_CONFIG_PATH = os.path.join(CURRENT_DIR, "datasets_config.json")
 MODEL_PATH = os.path.join(RESOURCES_DIR, "qwen_model")
 
 # 确保目录存在
@@ -59,6 +61,66 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def load_dataset_registry():
+    """
+    读取数据集注册表，返回 {dataset_name: relative_or_abs_path}
+    """
+    if not os.path.exists(DATASETS_CONFIG_PATH):
+        return {"alpaca_local": DATASET_PATH}
+
+    try:
+        with open(DATASETS_CONFIG_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:
+        print(f"⚠️ 读取 datasets_config.json 失败，回退默认数据集: {e}")
+        return {"alpaca_local": DATASET_PATH}
+
+    registry = {}
+    for k, v in raw.items():
+        if isinstance(v, dict):
+            p = v.get("path", "")
+        else:
+            p = str(v)
+
+        if not p:
+            continue
+
+        if os.path.isabs(p):
+            registry[k] = p
+        else:
+            registry[k] = os.path.join(CURRENT_DIR, p)
+
+    if "alpaca_local" not in registry:
+        registry["alpaca_local"] = DATASET_PATH
+    return registry
+
+
+def resolve_dataset_path(dataset_name=None, dataset_path=None):
+    """
+    优先级: 显式 dataset_path > dataset_name(注册表) > 默认 alpaca_local
+    """
+    if dataset_path:
+        return dataset_path, "custom_path"
+
+    registry = load_dataset_registry()
+    if dataset_name and dataset_name in registry:
+        return registry[dataset_name], dataset_name
+
+    return registry.get("alpaca_local", DATASET_PATH), "alpaca_local"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="SFT multi-model comparison server")
+    parser.add_argument("--dataset", type=str, default="alpaca_local", help="数据集名称（来自 datasets_config.json）")
+    parser.add_argument("--dataset_path", type=str, default=None, help="直接指定 JSON 数据路径（优先级高于 --dataset）")
+    parser.add_argument("--n_samples", type=int, default=None, help="覆盖默认样本数")
+    parser.add_argument("--poison_ratio", type=float, default=None, help="覆盖默认投毒比例")
+    parser.add_argument("--n_val_samples", type=int, default=None, help="覆盖默认验证样本数")
+    parser.add_argument("--seed", type=int, default=None, help="覆盖默认随机种子")
+    parser.add_argument("--output_subdir", type=str, default=None, help="结果输出子目录（例如 dolly_15k）")
+    return parser.parse_args()
 
 # ==========================================
 # 1. 资源下载与准备 (纯净版 - 不依赖 datasets 库)
@@ -100,7 +162,7 @@ def get_local_model_path():
         print(f"❌ HuggingFace 下载失败: {e}")
         raise RuntimeError("无法下载模型，请手动下载 Qwen1.5-0.5B 到 server_resources/qwen_model")
 
-def prepare_data_local():
+def prepare_data_local(dataset_path=None):
     """
     加载数据并进行切分、投毒
     返回:
@@ -110,13 +172,15 @@ def prepare_data_local():
     4. oracle_data (用于 Shapley 计算的验证集)
     """
     print("📥 正在读取数据文件...")
+    target_dataset_path = dataset_path or DATASET_PATH
     
     ds_full = None
-    if os.path.exists(DATASET_PATH):
+    if os.path.exists(target_dataset_path):
         try:
-            with open(DATASET_PATH, 'r', encoding='utf-8') as f:
+            with open(target_dataset_path, 'r', encoding='utf-8') as f:
                 ds_full = json.load(f)
             print(f"✅ 成功加载 JSON 数据: {len(ds_full)} 条")
+            print(f"📄 数据路径: {target_dataset_path}")
         except Exception as e:
             print(f"❌ 数据加载失败: {e}")
     
@@ -521,13 +585,36 @@ def run_sft_training(model_path, dataset_list, run_name):
 # ==========================================
 # 主流程
 # ==========================================
-def main():
+def main(args=None):
+    if args is None:
+        args = parse_args()
+
+    if args.n_samples is not None:
+        CONFIG['n_samples'] = args.n_samples
+    if args.poison_ratio is not None:
+        CONFIG['poison_ratio'] = args.poison_ratio
+    if args.n_val_samples is not None:
+        CONFIG['n_val_samples'] = args.n_val_samples
+    if args.seed is not None:
+        CONFIG['seed'] = args.seed
+
+    dataset_path, dataset_name = resolve_dataset_path(args.dataset, args.dataset_path)
+    if args.output_subdir:
+        CONFIG['output_dir'] = os.path.join(CURRENT_DIR, "server_results", args.output_subdir)
+    elif dataset_name != "alpaca_local":
+        CONFIG['output_dir'] = os.path.join(CURRENT_DIR, "server_results", dataset_name)
+
+    os.makedirs(CONFIG['output_dir'], exist_ok=True)
+
     print(f"🌟 SFT Server Persistent Demo (Multi-Model Comparison) 启动")
+    print(f"🗂️ 使用数据集: {dataset_name}")
+    print(f"📁 数据文件: {dataset_path}")
+    print(f"📦 输出目录: {CONFIG['output_dir']}")
     
     model_path = get_local_model_path()
     
     # 1. 准备数据
-    raw_dirty, raw_pure, dirty_indices_gt, oracle_data = prepare_data_local()
+    raw_dirty, raw_pure, dirty_indices_gt, oracle_data = prepare_data_local(dataset_path)
     
     # ----------------------------------------------------
     # 2. 计算 Gradient Shapley (Ours)
@@ -587,3 +674,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ 
