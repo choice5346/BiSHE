@@ -1,6 +1,7 @@
 import os
 import math
 import argparse
+import json
 from collections import Counter
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -9,9 +10,6 @@ from tqdm import tqdm
 
 from sft_server import (
     get_local_model_path,
-    prepare_data_local,
-    calculate_shapley,
-    calculate_repsim_scores,
     resolve_dataset_path,
     CONFIG,
 )
@@ -23,13 +21,11 @@ RESULTS_DIR = os.path.join(CURRENT_DIR, "server_results")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate SFT adapters with original protocol")
+    parser = argparse.ArgumentParser(description="Evaluate SFT adapters with FAIR, UNSEEN testing protocol")
     parser.add_argument("--dataset", type=str, default="alpaca_local", help="Dataset key in registry")
     parser.add_argument("--dataset_path", type=str, default=None, help="Custom dataset path")
-    parser.add_argument("--n_samples", type=int, default=None, help="Number of samples to use")
-    parser.add_argument("--poison_ratio", type=float, default=None, help="Poison ratio")
-    parser.add_argument("--n_val_samples", type=int, default=None, help="Oracle validation size")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--n_samples", type=int, default=None, help="Number of samples used in training")
+    parser.add_argument("--test_samples", type=int, default=20, help="Number of unseen testing samples")
     parser.add_argument(
         "--output_subdir",
         type=str,
@@ -56,14 +52,11 @@ def calculate_rouge_l(pred, ref):
         return 0.0
     return 2.0 * lcs_len / (len(x) + len(y))
 
-
 def normalize_text(s):
     return " ".join(s.strip().lower().split())
 
-
 def exact_match(pred, ref):
     return 1.0 if normalize_text(pred) == normalize_text(ref) else 0.0
-
 
 def char_f1(pred, ref):
     p = list(pred.strip())
@@ -78,7 +71,6 @@ def char_f1(pred, ref):
     if precision + recall == 0:
         return 0.0
     return 2 * precision * recall / (precision + recall)
-
 
 def bleu1_char(pred, ref):
     p = list(pred.strip())
@@ -102,32 +94,6 @@ def relative_length_error(pred, ref):
     if lr == 0:
         return 1.0 if lp > 0 else 0.0
     return abs(lp - lr) / lr
-
-
-def build_original_logic_datasets(model_path, dataset_path):
-    print("\n[Step 1] Rebuild datasets with original pipeline...")
-    raw_dirty, raw_pure, _dirty_indices_gt, oracle_data = prepare_data_local(dataset_path)
-
-    sv = calculate_shapley(model_path, raw_dirty, oracle_data)
-    n_remove = int(len(raw_dirty) * CONFIG["poison_ratio"])
-
-    keep_indices_grad = sv.argsort()[n_remove:]
-    cleaned_gradient_knn = [raw_dirty[i] for i in keep_indices_grad]
-
-    repsim_scores_mean, repsim_scores_knn = calculate_repsim_scores(model_path, raw_dirty, oracle_data)
-    keep_indices_mean = repsim_scores_mean.argsort()[n_remove:]
-    keep_indices_knn = repsim_scores_knn.argsort()[n_remove:]
-
-    cleaned_repsim_mean = [raw_dirty[i] for i in keep_indices_mean]
-    cleaned_repsim_knn = [raw_dirty[i] for i in keep_indices_knn]
-
-    return {
-        "dirty_model": raw_dirty,
-        "oracle_model": raw_pure,
-        "clean_model_gradient_knn": cleaned_gradient_knn,
-        "clean_model_repsim_mean": cleaned_repsim_mean,
-        "clean_model_repsim_knn": cleaned_repsim_knn,
-    }
 
 
 def evaluate_model(model_name, test_samples, tokenizer, result_base_dir):
@@ -154,7 +120,7 @@ def evaluate_model(model_name, test_samples, tokenizer, result_base_dir):
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=50,
+                max_new_tokens=100,
                 pad_token_id=tokenizer.eos_token_id,
                 do_sample=False,
             )
@@ -187,12 +153,6 @@ def evaluate(args=None):
 
     if args.n_samples is not None:
         CONFIG["n_samples"] = args.n_samples
-    if args.poison_ratio is not None:
-        CONFIG["poison_ratio"] = args.poison_ratio
-    if args.n_val_samples is not None:
-        CONFIG["n_val_samples"] = args.n_val_samples
-    if args.seed is not None:
-        CONFIG["seed"] = args.seed
 
     dataset_path, dataset_name = resolve_dataset_path(args.dataset, args.dataset_path)
     if args.output_subdir:
@@ -210,9 +170,18 @@ def evaluate(args=None):
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_PATH, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-
-    model_path = get_local_model_path()
-    datasets_map = build_original_logic_datasets(model_path, dataset_path)
+        
+    print("\n[Step 1] Loading pure, unseen test samples from JSON...")
+    # 真正的绝对公平：从 JSON 中读取所有模型在训练期绝对没见过的全新未考数据
+    with open(dataset_path, 'r', encoding='utf-8') as f:
+        full_data = json.load(f)
+    
+    train_n = CONFIG["n_samples"]
+    # 选取训练集范围之外的独立数据（例如训练用了0-1000条，那我们就拿1000条之后的数据作为全新测练题）
+    unseen_test_samples = full_data[train_n : train_n + args.test_samples] 
+    if len(unseen_test_samples) == 0:
+        print("警告：数据集后面的数据不足，只能取末尾倒数来兜底，这可能仍然会导致数据泄漏。")
+        unseen_test_samples = full_data[-args.test_samples:] # 数据量不够时的兜底逻辑
 
     all_results = {}
     ordered_models = [
@@ -223,10 +192,10 @@ def evaluate(args=None):
         "clean_model_repsim_knn",
     ]
 
-    print("\n[Step 2] Evaluate each model on its own first-10 samples (original logic)...")
+    print(f"\n[Step 2] Evaluate all models on a TRULY UNSEEN, FAIR test set ({len(unseen_test_samples)} samples)...")
     for model_name in ordered_models:
-        test_samples = datasets_map[model_name][:10]
-        print(f"\nEvaluating {model_name} on its own 10 samples...")
+        test_samples = unseen_test_samples
+        print(f"\nEvaluating {model_name} on {len(test_samples)} unseen samples...")
         try:
             metrics = evaluate_model(model_name, test_samples, tokenizer, result_base_dir)
             if metrics is None:
@@ -243,7 +212,7 @@ def evaluate(args=None):
         except Exception as e:
             print(f"Error evaluating {model_name}: {e}")
 
-    print("\n\nFINAL COMPARISON (Original Logic: each model on its own first-10):")
+    print(f"\n\nFINAL COMPARISON (FAIR, UNSEEN TEST SET) - Dataset: {dataset_name}:")
     print("-------------------------------------------------------------------")
     if not all_results:
         print("No available results.")
